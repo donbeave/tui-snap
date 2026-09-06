@@ -1,0 +1,29 @@
+[package]
+name = "tuisnap"
+version = "0.1.0"
+edition = "2021"
+description = "Best-in-class TUI snapshot tool: PTY capture + Ratatui headless dumps to ANSI/TXT/SVG/HTML/PNG/JSON with digest baselines"
+license = "Apache-2.0"
+
+[[bin]]
+name = "tuisnap"
+path = "src/main.rs"
+
+[lib]
+name = "tuisnap"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+portable-pty = "0.8"
+vt100 = "0.15"
+image = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+unicode-width = "0.2"
+
+[dev-dependencies]
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+tempfile = "3"
