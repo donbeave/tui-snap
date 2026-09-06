@@ -1,20 +1,38 @@
-//! Cell + Frame model: the single artifact every exporter reads.
+//! Canonical frame schema (v2): the single artifact both capture paths share.
 //!
-//! Borrowed from `cellshot` (versioned `Frame` JSON) and `vt100` (screen
-//! semantics), kept dependency-free so both the PTY path and the Ratatui
-//! `TestBackend` path converge here.
+//! ```text
+//! fixture model + view state + viewport + theme ──▶ production Ratatui view ──▶ Frame
+//! real executable ──▶ PTY + terminal-state engine ──▶ Frame
+//! ```
+//!
+//! A [`Frame`] preserves grapheme content, cell positions and widths
+//! (including wide-cell continuations), default/indexed/RGB colors, the
+//! supported modifier set, cursor state, and provenance. It deliberately does
+//! NOT preserve terminal-protocol details that do not affect the visible
+//! grid (hyperlink targets, kitty image payloads, blink phase): those belong
+//! in additional assertions, not in a screenshot contract.
+//!
+//! Import is strict: [`Frame::validate`] rejects malformed frames with an
+//! explicit error instead of guessing.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-/// RGB color. `None` on a cell means "terminal default".
+/// Schema version. Bump on any incompatible change and migrate readers.
+pub const FRAME_VERSION: u8 = 2;
+
+/// Maximum viewport dimension accepted on import (DoS bound).
+pub const MAX_DIM: u16 = 512;
+
+/// RGB color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Color {
+pub struct Rgb {
     pub r: u8,
     pub g: u8,
     pub b: u8,
 }
 
-impl Color {
+impl Rgb {
     #[must_use]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
@@ -25,9 +43,9 @@ impl Color {
         format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
     }
 
-    /// Map xterm-256 index to RGB (same table as tcc `tools/ansi2html.py`).
+    /// Standard xterm palette entry (same table terminals use).
     #[must_use]
-    pub fn from_256(n: u8) -> Self {
+    pub fn from_indexed(n: u8) -> Self {
         const BASIC: [[u8; 3]; 16] = [
             [0, 0, 0],
             [205, 49, 49],
@@ -60,55 +78,158 @@ impl Color {
     }
 }
 
-/// One terminal cell.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cell {
-    pub symbol: String,
-    pub fg: Option<Color>,
-    pub bg: Option<Color>,
+/// A cell color: terminal default, palette index, or direct RGB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Color {
+    Default,
+    Indexed(u8),
+    Rgb(Rgb),
+}
+
+/// Supported cell modifiers. Blink phase and concealment are intentionally
+/// absent: a frozen frame renders blink as visible. Ratatui
+/// `SLOW_BLINK`/`RAPID_BLINK` therefore collapse to unmarked (documented
+/// loss), and Ratatui `HIDDEN` is UNSUPPORTED — cells styled HIDDEN render
+/// visibly and must be covered by separate assertions, never by a screenshot
+/// gate. Hyperlink targets, kitty image payloads, and blink phase likewise
+/// belong in additional assertions, not in this contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Mods {
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
     pub underline: bool,
+    pub strikethrough: bool,
     pub reverse: bool,
 }
 
-impl Default for Cell {
-    fn default() -> Self {
+/// One grid cell.
+///
+/// Wide graphemes occupy two columns: the lead cell carries
+/// `width = 2` and the symbol, the follower carries `width = 0`,
+/// `continuation = true`, and an empty symbol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cell {
+    pub x: u16,
+    pub y: u16,
+    /// Visible grapheme cluster ("" for continuation cells and blanks-as-space).
+    pub symbol: String,
+    /// Display width in columns: 0 (continuation), 1, or 2 (wide).
+    pub width: u8,
+    pub continuation: bool,
+    pub fg: Color,
+    pub bg: Color,
+    pub mods: Mods,
+}
+
+impl Cell {
+    #[must_use]
+    pub fn blank(x: u16, y: u16) -> Self {
         Self {
+            x,
+            y,
             symbol: " ".to_string(),
-            fg: None,
-            bg: None,
-            bold: false,
-            dim: false,
-            italic: false,
-            underline: false,
-            reverse: false,
+            width: 1,
+            continuation: false,
+            fg: Color::Default,
+            bg: Color::Default,
+            mods: Mods::default(),
         }
     }
 }
 
-/// Visible screen: `rows` of `cols` cells + cursor.
+/// Cursor visual style (blink phase is frozen as visible; see module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CursorStyle {
+    #[default]
+    Block,
+    Underline,
+    Bar,
+}
+
+/// Terminal cursor state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Cursor {
+    pub x: u16,
+    pub y: u16,
+    pub visible: bool,
+    pub style: CursorStyle,
+    pub blinking: bool,
+}
+
+/// Where a frame came from. Recorded so reports are auditable; `created_unix`
+/// is informational only and excluded from equality comparisons that must be
+/// deterministic (use [`Frame::digest`] / cell comparison for gates).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    pub tool: String,
+    pub tool_version: String,
+    pub profile: String,
+    pub source: String,
+    pub argv: Vec<String>,
+    pub created_unix: u64,
+}
+
+impl Provenance {
+    #[must_use]
+    pub fn now(profile: &str, source: &str, argv: Vec<String>) -> Self {
+        Self {
+            tool: "tuisnap".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            profile: profile.to_string(),
+            source: source.to_string(),
+            argv,
+            created_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// The canonical frame: `rows` × `cols` cells in row-major order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
     pub version: u8,
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<Cell>,
-    pub cursor: Option<(u16, u16)>,
-    pub cursor_visible: bool,
+    pub cursor: Cursor,
+    pub provenance: Provenance,
 }
+
+/// Import/validation failure: explicit, never silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameError(pub String);
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid frame: {}", self.0)
+    }
+}
+
+impl std::error::Error for FrameError {}
 
 impl Frame {
     #[must_use]
-    pub fn blank(cols: u16, rows: u16) -> Self {
+    pub fn blank(cols: u16, rows: u16, provenance: Provenance) -> Self {
+        assert!(
+            cols > 0 && rows > 0 && cols <= MAX_DIM && rows <= MAX_DIM,
+            "blank frame dimensions out of range: {cols}x{rows}"
+        );
+        let mut cells = Vec::with_capacity(cols as usize * rows as usize);
+        for y in 0..rows {
+            for x in 0..cols {
+                cells.push(Cell::blank(x, y));
+            }
+        }
         Self {
-            version: 1,
+            version: FRAME_VERSION,
             cols,
             rows,
-            cells: vec![Cell::default(); cols as usize * rows as usize],
-            cursor: None,
-            cursor_visible: false,
+            cells,
+            cursor: Cursor::default(),
+            provenance,
         }
     }
 
@@ -120,8 +241,8 @@ impl Frame {
         }
     }
 
-    pub fn set(&mut self, x: u16, y: u16, cell: Cell) {
-        if let Some(i) = self.idx(x, y) {
+    pub fn set(&mut self, cell: Cell) {
+        if let Some(i) = self.idx(cell.x, cell.y) {
             self.cells[i] = cell;
         }
     }
@@ -131,8 +252,142 @@ impl Frame {
         self.idx(x, y).map(|i| &self.cells[i])
     }
 
-    /// Plain text, rows joined with `\n`, trailing spaces trimmed per row
-    /// (matches `tmux capture-pane -p` semantics used by tcc `shots/*.txt`).
+    /// Strict validation for imports. Rejects: wrong version, zero/oversize
+    /// dimensions, cell-count mismatch, out-of-order or out-of-bounds cells,
+    /// bad widths, dangling continuations, empty lead symbols.
+    pub fn validate(&self) -> Result<(), FrameError> {
+        let bad = |m: &str| FrameError(m.to_string());
+        if self.version != FRAME_VERSION {
+            return Err(bad(&format!(
+                "unsupported version {}, want {FRAME_VERSION}",
+                self.version
+            )));
+        }
+        if self.cols == 0 || self.rows == 0 {
+            return Err(bad("dimensions must be nonzero"));
+        }
+        if self.cols > MAX_DIM || self.rows > MAX_DIM {
+            return Err(bad(&format!(
+                "dimensions {}x{} exceed max {MAX_DIM}",
+                self.cols, self.rows
+            )));
+        }
+        if self.cells.len() != self.cols as usize * self.rows as usize {
+            return Err(bad(&format!(
+                "cell count {} != {}x{}",
+                self.cells.len(),
+                self.cols,
+                self.rows
+            )));
+        }
+        for (i, c) in self.cells.iter().enumerate() {
+            let (ex, ey) = (
+                (i % self.cols as usize) as u16,
+                (i / self.cols as usize) as u16,
+            );
+            if c.x != ex || c.y != ey {
+                return Err(bad(&format!(
+                    "cell {i} positioned at ({},{}) but stored at ({ex},{ey})",
+                    c.x, c.y
+                )));
+            }
+            match (c.width, c.continuation) {
+                (0, true) => {
+                    if c.x == 0 {
+                        return Err(bad(&format!("continuation at row start ({},{})", c.x, c.y)));
+                    }
+                    let lead = &self.cells[i - 1];
+                    if lead.width != 2 || lead.continuation {
+                        return Err(bad(&format!("dangling continuation at ({},{})", c.x, c.y)));
+                    }
+                    if !c.symbol.is_empty() {
+                        return Err(bad(&format!(
+                            "continuation at ({},{}) must have empty symbol",
+                            c.x, c.y
+                        )));
+                    }
+                }
+                (1 | 2, false) => {
+                    if c.symbol.is_empty() {
+                        return Err(bad(&format!(
+                            "lead cell at ({},{}) must have a symbol",
+                            c.x, c.y
+                        )));
+                    }
+                    // Cross-check display width against unicode-width so a
+                    // 1-cell glyph can never claim 2 cells (the renderer
+                    // would span it wrongly and digests would lie).
+                    let measured = unicode_width::UnicodeWidthStr::width(c.symbol.as_str());
+                    // Combining sequences measure 1; anything wider than
+                    // claimed, or a width-2 claim on a narrow symbol, is
+                    // rejected. (East-Asian Ambiguous treatment follows
+                    // unicode-width; see renderer docs.)
+                    if c.width == 2 && measured != 2 {
+                        return Err(bad(&format!(
+                            "cell at ({},{}) claims width 2 for {:?} (measured {measured})",
+                            c.x, c.y, c.symbol
+                        )));
+                    }
+                    if c.width == 1 && measured > 1 {
+                        return Err(bad(&format!(
+                            "cell at ({},{}) claims width 1 for {:?} (measured {measured})",
+                            c.x, c.y, c.symbol
+                        )));
+                    }
+                    if c.width == 2 {
+                        if c.x + 1 >= self.cols {
+                            return Err(bad(&format!(
+                                "wide cell at ({},{}) overflows row",
+                                c.x, c.y
+                            )));
+                        }
+                        let next = &self.cells[i + 1];
+                        if next.width != 0 || !next.continuation {
+                            return Err(bad(&format!(
+                                "wide cell at ({},{}) missing continuation",
+                                c.x, c.y
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(bad(&format!(
+                        "bad width/continuation at ({},{}): width={} continuation={}",
+                        c.x, c.y, c.width, c.continuation
+                    )));
+                }
+            }
+        }
+        if self.cursor.visible && (self.cursor.x >= self.cols || self.cursor.y >= self.rows) {
+            return Err(bad("visible cursor outside grid"));
+        }
+        Ok(())
+    }
+
+    /// Parse + validate canonical JSON.
+    pub fn from_json(text: &str) -> Result<Self, FrameError> {
+        let frame: Self =
+            serde_json::from_str(text).map_err(|e| FrameError(format!("bad JSON: {e}")))?;
+        frame.validate()?;
+        Ok(frame)
+    }
+
+    /// Compact canonical JSON: the stored/transmitted form. Pretty-printing
+    /// is for humans only and must never be a gate input (whitespace is not
+    /// significant; parsers accept both).
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("Frame is always serializable")
+    }
+
+    /// Pretty JSON for human display (report `<pre>`, debugging).
+    #[must_use]
+    pub fn to_json_pretty(&self) -> String {
+        serde_json::to_string_pretty(self).expect("Frame is always serializable")
+    }
+
+    /// Plain text: rows joined with `\n`, trailing blanks trimmed per row.
+    /// Continuation cells contribute nothing (the lead already holds the symbol).
     #[must_use]
     pub fn text(&self) -> String {
         let mut out = String::new();
@@ -143,7 +398,9 @@ impl Frame {
             let mut row = String::new();
             for x in 0..self.cols {
                 if let Some(c) = self.get(x, y) {
-                    row.push_str(&c.symbol);
+                    if !c.continuation {
+                        row.push_str(&c.symbol);
+                    }
                 }
             }
             out.push_str(row.trim_end());
@@ -151,45 +408,130 @@ impl Frame {
         out
     }
 
-    /// Build from a `vt100` screen (the PTY path: cellshot/ratatui-testlib approach).
+    /// Deterministic content digest over cells + cursor (provenance excluded:
+    /// timestamps must not break gates). 16-hex display via format!("{digest:016x}").
     #[must_use]
-    pub fn from_vt100(screen: &vt100::Screen) -> Self {
-        fn conv(c: vt100::Color) -> Option<Color> {
+    pub fn digest(&self) -> u64 {
+        const OFF: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0100_0000_01b3;
+        fn mix(mut h: u64, bytes: &[u8]) -> u64 {
+            for b in bytes {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(PRIME);
+            }
+            h
+        }
+        let mut h = OFF;
+        h = mix(h, &[self.version]);
+        h = mix(h, &self.cols.to_le_bytes());
+        h = mix(h, &self.rows.to_le_bytes());
+        for c in &self.cells {
+            h = mix(h, &c.x.to_le_bytes());
+            h = mix(h, &c.y.to_le_bytes());
+            h = mix(h, c.symbol.as_bytes());
+            h = mix(h, &[c.width, u8::from(c.continuation)]);
+            h = mix(h, format!("{:?}|{:?}|{:?}", c.fg, c.bg, c.mods).as_bytes());
+        }
+        h = mix(
+            h,
+            format!(
+                "{},{},{},{:?},{}",
+                self.cursor.x,
+                self.cursor.y,
+                self.cursor.visible,
+                self.cursor.style,
+                self.cursor.blinking
+            )
+            .as_bytes(),
+        );
+        h
+    }
+
+    /// Exact cell comparison. Returns differing (x, y) positions; cursor
+    /// differences are reported AT the cursor position, and callers must
+    /// render cursor-aware summaries (see [`summarize_cursor`]): when only
+    /// the cursor changed, the cells at that position compare equal.
+    /// Dimensions must match; a dimension mismatch is an Err, not a diff.
+    pub fn diff_cells(&self, other: &Self) -> Result<Vec<(u16, u16)>, FrameError> {
+        if self.cols != other.cols || self.rows != other.rows {
+            return Err(FrameError(format!(
+                "dimension mismatch: {}x{} vs {}x{}",
+                self.cols, self.rows, other.cols, other.rows
+            )));
+        }
+        let mut out = Vec::new();
+        for (a, b) in self.cells.iter().zip(other.cells.iter()) {
+            if a.symbol != b.symbol
+                || a.width != b.width
+                || a.continuation != b.continuation
+                || a.fg != b.fg
+                || a.bg != b.bg
+                || a.mods != b.mods
+            {
+                out.push((a.x, a.y));
+            }
+        }
+        if self.cursor != other.cursor {
+            out.push((other.cursor.x, other.cursor.y));
+        }
+        Ok(out)
+    }
+
+    /// Human-readable cursor summary for cursor-only diagnostics.
+    #[must_use]
+    pub fn summarize_cursor(c: &Cursor) -> String {
+        format!(
+            "cursor ({},{}) visible={} style={:?} blink={}",
+            c.x, c.y, c.visible, c.style, c.blinking
+        )
+    }
+
+    /// Downgrade a trailing wide lead (last column, no room for its
+    /// continuation) to width 1. Converters call this when an emulator or
+    /// buffer hands them a wide grapheme at the exact row end instead of
+    /// wrapping it — without it the frame would fail validation.
+    pub fn clamp_trailing_wide(&mut self) {
+        if self.cols == 0 {
+            return;
+        }
+        for y in 0..self.rows {
+            let i = y as usize * self.cols as usize + (self.cols as usize - 1);
+            if self.cells[i].width == 2 && !self.cells[i].continuation {
+                self.cells[i].width = 1;
+            }
+        }
+    }
+    /// Returns (fg, bg) after reverse/underline-color/dim handling.
+    #[must_use]
+    pub fn resolve_cell(cell: &Cell, default_fg: Rgb, default_bg: Rgb) -> (Rgb, Rgb) {
+        fn rgb(c: Color, dflt: Rgb) -> Rgb {
             match c {
-                vt100::Color::Default => None,
-                vt100::Color::Idx(i) => Some(Color::from_256(i)),
-                vt100::Color::Rgb(r, g, b) => Some(Color::new(r, g, b)),
+                Color::Default => dflt,
+                Color::Indexed(i) => Rgb::from_indexed(i),
+                Color::Rgb(r) => r,
             }
         }
-        let (rows, cols) = screen.size();
-        let mut f = Self::blank(cols, rows);
-        for y in 0..rows {
-            for x in 0..cols {
-                if let Some(vt) = screen.cell(y, x) {
-                    f.set(
-                        x,
-                        y,
-                        Cell {
-                            symbol: if vt.contents().is_empty() {
-                                " ".to_string()
-                            } else {
-                                vt.contents().to_string()
-                            },
-                            fg: conv(vt.fgcolor()),
-                            bg: conv(vt.bgcolor()),
-                            bold: vt.bold(),
-                            dim: false,
-                            italic: vt.italic(),
-                            underline: vt.underline(),
-                            reverse: vt.inverse(),
-                        },
-                    );
-                }
-            }
+        let (mut fg, mut bg) = (rgb(cell.fg, default_fg), rgb(cell.bg, default_bg));
+        if cell.mods.reverse {
+            std::mem::swap(&mut fg, &mut bg);
         }
-        let (cy, cx) = screen.cursor_position();
-        f.cursor = Some((cx, cy));
-        f.cursor_visible = !screen.hide_cursor();
-        f
+        if cell.mods.dim {
+            // 60% fg over bg (matches common terminal dim treatment).
+            let mix = |f: u8, b: u8| (f as u32 * 6 + b as u32 * 4) as u8 / 10;
+            fg = Rgb::new(mix(fg.r, bg.r), mix(fg.g, bg.g), mix(fg.b, bg.b));
+        }
+        (fg, bg)
+    }
+
+    /// Provenance-keyed identity for logs (never a gate by itself).
+    #[must_use]
+    pub fn key(&self, name: &str) -> String {
+        format!("{name} {} {}", self.cols, self.rows)
+    }
+
+    /// Deterministic reruns must produce identical digests AND identical PNG
+    /// bytes under the same profile; see `render` tests.
+    pub fn palette_map() -> BTreeMap<u8, Rgb> {
+        (0..=255).map(|i| (i, Rgb::from_indexed(i))).collect()
     }
 }

@@ -1,67 +1,108 @@
-# tuisnap — TUI snapshots for humans and refactors
+# tuisnap — Rust TUI visual-regression toolkit
 
-One artifact model, two capture paths, six formats.
+Two capture paths share one canonical frame; both produce full approved
+frames, readable PNGs, and portable HTML expected/actual/diff reports.
 
 ```text
-cargo run -q -- run --cols 120 --rows 40 --format txt --format png --format svg \
-  --out shots/home -- ./my-tui --flag
-cargo run -q -- render --input shots/home.ansi --cols 120 --rows 40 \
-  --format png --format html --out shots/home
-cargo run -q -- digest --input shots/home.ansi --name home --baseline baselines/tui.txt
-BLESS=1 cargo run -q -- digest --input shots/home.ansi --name home --baseline baselines/tui.txt
+Fixture model + view state + viewport + theme
+        └─▶ actual production Ratatui view ──▶ frame        (no PTY, no subprocess)
+
+Real executable ──▶ PTY + terminal-state engine ──▶ frame   (keyboard/mouse/resize)
 ```
 
-## Library (Ratatui refactoring guard)
+A changed snapshot requires explicit review (`tuisnap accept`). Equality only
+validates the fixtures covered — never every app state.
+
+## Quick start: pure view tests
 
 ```rust
-use ratatui::widgets::Paragraph;
-use tuisnap::{Baseline, ratatui_shot::widget_frame};
+use tuisnap::{Profile, Provenance, VENDORED_FONT};
+use tuisnap::snapshot::Store;
 
 #[test]
-fn screens_pinned() {
-    let base = Baseline::new("tests/baselines/tui.txt");
-    for (name, text) in [("home", "hello"), ("empty", "nothing")] {
-        let frame = widget_frame(Paragraph::new(text), 120, 40);
-        base.assert_frame(name, &frame).unwrap();
-        tuisnap::render::write_format(&frame, "png", &format!("shots/{name}")).unwrap();
-    }
+fn home_screen() {
+    let store = Store::new(std::path::Path::new("tests/visual"));
+    let profile = Profile::default_profile();
+    // Render the ACTUAL production view from fixture data:
+    let frame = tuisnap::ratatui::draw_frame(120, 40, prov(), |f| {
+        myapp::render_home(f, &fixture_model())
+    });
+    // Actual artifacts are written BEFORE the assertion, so a failure still
+    // leaves reviewable evidence (actual/*.frame.json + *.png + report.html).
+    let outcome = store.check("home", &frame, &profile, VENDORED_FONT, 1.0).unwrap();
+    outcome.ensure_matched().unwrap();
 }
 ```
 
-Headless `TestBackend` dumps: deterministic, no PTY flake. Drive app state
-machine via method calls, dump each screen, pin with `Baseline`.
-`BLESS=1` / `UPDATE_SNAPSHOT=1` / `UPDATE_BASELINE=1` regenerate.
+First run fails with `missing-approval` (fail-closed). Inspect
+`actual/*.png` + `report.html`, then accept explicitly:
+
+```text
+cargo run -q -- accept --store tests/visual --name home   # one snapshot
+cargo run -q -- accept --store tests/visual --all         # everything reviewed
+```
+
+There is deliberately **no** `BLESS=1` / auto-accept: CI must never approve
+snapshots by itself (see `docs/CI.md`).
+
+## Interactive tests (feature `pty`, on by default)
+
+```rust
+let mut s = tuisnap::pty::Session::spawn(&["./my-tui".into()], &opts)?;
+s.wait_for_text("Ready")?;                 // timeout fails WITH the screen
+s.send_key("enter")?;
+let frame = s.wait_stable(Duration::from_millis(300))?;  // style-aware settle
+```
+
+Pure view tests build without the PTY engine: `cargo test --no-default-features`.
 
 ## CLI
 
-- `run`: spawn any binary in real PTY (no tmux), `--send` steps
-  (`type:<..>`, `enter|escape|tab|up|down|left|right|space|ctrl-x|text:..`,
-  `sleep:<ms>`, `wait:<needle>`), `--wait-for`, settle on idle, write
-  `--format` repeats to `--out.<ext>`.
-- `render`: offline `.ansi` → `txt|ansi|json|svg|html|png` (replaces
-  `ansi2png.py` / `ansi2html.py`, no Python/fonts needed).
-- `digest`: `.ansi|.txt|.json` → FNV-1a vs `name cols rows hash` baseline.
+```text
+tuisnap render --input shot.frame.json --format png --format svg --out shot
+tuisnap check  --store tests/visual --name home --input actual.frame.json
+tuisnap accept --store tests/visual --name home        # or --all
+tuisnap report --store tests/visual                    # re-verify + rewrite report.html
+tuisnap run --cols 120 --rows 40 --send enter --wait-for Ready \
+  --store shots --name home -- ./my-tui                # capture + gate
+```
 
-## Lineage (borrowed best)
+`render` also accepts `--font-file` (hash recorded); all gates accept it too.
+Offline `frame.json` re-renders byte-identical PNGs (proven by tests).
 
-- `terminal-components-claude` `tools/capture.sh`: fixed geometry, key/mouse
-  scripts, `ansi/txt/cursor/html/png` bundle, provenance, atomic publish,
-  digest baselines (`Harness` + `Scene` + `BLESS=1`).
-- `cellshot`: `portable-pty` + `vt100`, `show/save/start/send/wait/resize/stop`,
-  `wait-for-text/idle`, settle-before-snapshot, repeat `--format`, versioned
-  JSON, `.cellshot` recordings, driver protocol.
-- `ratatui-testlib`: PTY harness + `insta`/`expect-test` snapshots.
-- `TestBackend` + `insta`: in-process golden tests (this crate's `ratatui_shot`).
-- `term-transcript`: SVG transcripts as test oracles.
-- `freeze` / `termshot` / `anstyle-svg`: pretty SVG/PNG from ANSI.
-- `VHS`: tape-script demos → GIF/MP4 (roadmap: `record` script file + `video`).
+## Layout of a store
 
-## Roadmap to best-in-class
+```text
+<store>/approved/<name>.frame.json   # the only committed artifact (compact JSON)
+<store>/actual/<name>.frame.json     # local evidence (gitignored)
+<store>/actual/<name>.png
+<store>/diff/<name>.png              # red-overlay diff, on mismatch
+<store>/report.html                  # portable: embedded PNGs + frame JSON
+```
 
-1. Named sessions (`start/send/wait/show/save/stop`, Unix socket).
-2. Tape file (`record` script → reproducible multi-shot runs).
-3. Font-accurate PNG (embedded TTF via `fontdue`) + GIF/MP4 via `ffmpeg`.
-4. `insta` adapter macro + cursor/mouse SGR + scrollback/logs split.
+Approved PNGs regenerate deterministically and are not committed.
+
+## Fidelity contract
+
+- Layout from frame widths (CJK keeps 2 cells even as tofu); real glyphs via
+  `fontdue` from a pinned vendored font — never placeholder blocks.
+- Profile pins font bytes (SHA-256), 10×19 cells at 16px, palette, scale ×2,
+  cursor policy. `verify_geometry` fails loudly on drift.
+- Covered: box drawing, blocks, Braille, Nerd icons, combining marks.
+  CJK/emoji without font coverage render as deterministic tofu with correct
+  advance (documented in `assets/fonts/FONTS.md`).
+- Terminal-like, measured fidelity — NOT pixel-identity with any terminal
+  emulator. Faux-bold (double-strike) and faux-italic (shear) are documented
+  approximations; cell data stays authoritative for styles.
+
+## Docs
+
+- `docs/USAGE.md` — patterns, CLI reference, approval workflow
+- `docs/MIGRATION.md` — v0.1 → v0.2 (breaking), BLESS removal
+- `docs/CI.md` — CI wiring that cannot auto-accept
+- `assets/fonts/FONTS.md` — font licensing and coverage
+- `RESEARCH.md` — architecture analysis this implements
+- `ALTERNATIVES-REVIEW.md`, `SIMILAR-PROJECTS.md` — competitor landscape
 
 ## License
 

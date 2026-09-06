@@ -1,23 +1,35 @@
-//! Real-PTY capture without tmux: `portable-pty` + `vt100`.
+//! Interactive tests: the real executable in a real PTY (feature `pty`).
 //!
-//! This is the `cellshot` / `ratatui-testlib` architecture (real pty,
-//! terminal emulation, wait-for-text/idle, settle before snapshot) packaged
-//! with tcc's ergonomics (fixed geometry, deterministic env, key scripts).
+//! The engine is [`termlens`](https://docs.rs/termlens) 0.9 (pure-cargo,
+//! sync, no daemon): it owns PTY lifetime, background reads, waits, and
+//! cleanup. This module is a thin fixture-oriented adapter that converts
+//! termlens screens into canonical [`Frame`]s and enforces the test contract:
+//!
+//! - waits **fail on timeout** (the error embeds the screen at timeout —
+//!   failure evidence for free);
+//! - stability waits are **style-aware** (`wait_stable`, not text-only idle);
+//! - resources are **bounded** (deadlines on every wait, capped scrollback);
+//! - cleanup is **guaranteed**: `Session` owns the termlens `Terminal`,
+//!   whose `Drop` kills and reaps the child even when a test panics.
+//!
+//! are not represented in [`Frame`] (frozen-frame semantics); see
+//! [`crate::frame`].
 
-use crate::frame::Frame;
+use crate::frame::{Cell, Color, Cursor, CursorStyle, Frame, Mods, Provenance, Rgb};
 use anyhow::{Context, Result};
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
-use std::io::{Read, Write};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// How long to wait for the app to settle before reading the screen.
+/// PTY session options.
 #[derive(Debug, Clone)]
 pub struct PtyOptions {
     pub cols: u16,
     pub rows: u16,
+    /// Default deadline for every wait.
     pub timeout: Duration,
-    pub settle: Duration,
-    pub env_term: String,
+    /// Scrollback rows retained (bounded).
+    pub scrollback: usize,
+    /// Extra environment entries (TERM/COLORTERM/LINES/COLUMNS preset).
+    pub env: Vec<(String, String)>,
 }
 
 impl Default for PtyOptions {
@@ -26,221 +38,244 @@ impl Default for PtyOptions {
             cols: 120,
             rows: 40,
             timeout: Duration::from_secs(5),
-            settle: Duration::from_millis(300),
-            env_term: "xterm-256color".into(),
+            scrollback: 1000,
+            env: Vec::new(),
         }
     }
 }
 
-/// One input step: typed text or a named key (`enter`, `escape`, `tab`, ...).
-#[derive(Debug, Clone)]
-pub enum WaitFor {
-    Text(String),
-    Idle,
+fn convert_color(c: termlens::Color) -> Color {
+    match c {
+        termlens::Color::Default => Color::Default,
+        termlens::Color::Indexed(i) => Color::Indexed(i),
+        termlens::Color::Rgb(r, g, b) => Color::Rgb(Rgb::new(r, g, b)),
+    }
 }
 
-/// A live PTY session (one-shot in v1; named sessions = roadmap).
-pub struct PtySession {
-    parser: vt100::Parser,
-    #[allow(dead_code)]
-    pair: portable_pty::PtyPair,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    opts: PtyOptions,
-}
-
-impl PtySession {
-    /// Spawn `argv[0]` with `argv[1..]` in a pty of `opts` geometry.
-    pub fn spawn(argv: &[String], opts: PtyOptions) -> Result<Self> {
-        anyhow::ensure!(!argv.is_empty(), "empty command");
-        let pty = NativePtySystem::default()
-            .openpty(PtySize {
-                rows: opts.rows,
-                cols: opts.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("openpty")?;
-        let mut cmd = CommandBuilder::new(&argv[0]);
-        for a in &argv[1..] {
-            cmd.arg(a);
-        }
-        cmd.env("TERM", &opts.env_term);
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("LINES", opts.rows.to_string());
-        cmd.env("COLUMNS", opts.cols.to_string());
-        // deterministic, tcc-style: callers can override via outer env if needed
-        let child = pty.slave.spawn_command(cmd).context("spawn")?;
-        let writer = pty.master.take_writer().context("writer")?;
-        let mut reader = pty.master.try_clone_reader().context("reader")?;
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
+/// Convert a termlens screen into a canonical [`Frame`].
+pub fn frame_from_screen(screen: &termlens::Screen, provenance: Provenance) -> Frame {
+    let cols = screen.cols();
+    let rows = screen.rows();
+    let mut frame = Frame::blank(cols, rows, provenance);
+    for r in 0..rows {
+        for c in 0..cols {
+            let Some(tc) = screen.cell(r, c) else {
+                continue;
+            };
+            if tc.is_wide_continuation() {
+                let mut cont = Cell::blank(c, r);
+                cont.width = 0;
+                cont.continuation = true;
+                cont.symbol = String::new();
+                frame.set(cont);
+                continue;
             }
-        });
+            let st = tc.style();
+            let symbol = if tc.contents().is_empty() {
+                " ".to_string()
+            } else {
+                tc.contents().to_string()
+            };
+            frame.set(Cell {
+                x: c,
+                y: r,
+                symbol,
+                width: if tc.is_wide() { 2 } else { 1 },
+                continuation: false,
+                fg: convert_color(st.fg),
+                bg: convert_color(st.bg),
+                mods: Mods {
+                    bold: st.bold,
+                    dim: st.dim,
+                    italic: st.italic,
+                    underline: st.underline,
+                    strikethrough: st.strikethrough,
+                    reverse: st.reverse,
+                },
+            });
+        }
+    }
+    // termlens reports (row, col, visible). Out-of-grid cursor positions are
+    // NOT clamped: `validate` rejects them loudly so emulator drift surfaces
+    // as an explicit error instead of a silently shifted cursor.
+    let (row, col, visible) = screen.cursor();
+    frame.cursor = Cursor {
+        x: col,
+        y: row,
+        visible,
+        style: match screen.cursor_shape() {
+            termlens::CursorShape::Underline => CursorStyle::Underline,
+            termlens::CursorShape::Bar => CursorStyle::Bar,
+            _ => CursorStyle::Block,
+        },
+        blinking: screen.cursor_blink().unwrap_or(false),
+    };
+    frame
+}
+
+/// A live PTY session. Dropping it kills and reaps the child (via termlens).
+pub struct Session {
+    term: termlens::Terminal,
+    argv: Vec<String>,
+    provenance: Provenance,
+}
+
+impl Session {
+    /// Spawn `argv[0]` with `argv[1..]` at `opts` geometry.
+    pub fn spawn(argv: &[String], opts: &PtyOptions) -> Result<Self> {
+        anyhow::ensure!(!argv.is_empty(), "empty command");
+        let mut b = termlens::Terminal::builder();
+        b = b.size(opts.cols, opts.rows);
+        b = b.timeout(opts.timeout);
+        b = b.scrollback(opts.scrollback);
+        b = b.env("TERM", "xterm-256color");
+        b = b.env("COLORTERM", "truecolor");
+        b = b.env("LINES", opts.rows.to_string());
+        b = b.env("COLUMNS", opts.cols.to_string());
+        for (k, v) in &opts.env {
+            b = b.env(k, v);
+        }
+        if argv.len() > 1 {
+            b = b.args(&argv[1..]);
+        }
+        let term = b.spawn(&argv[0]).context("spawn PTY")?;
         Ok(Self {
-            parser: vt100::Parser::new(opts.rows, opts.cols, 0),
-            pair: pty,
-            child,
-            writer,
-            rx,
-            opts,
+            term,
+            argv: argv.to_vec(),
+            provenance: Provenance::now("tuisnap-default", "pty", argv.to_vec()),
         })
     }
 
-    fn pump(&mut self, budget: Duration) {
-        let deadline = Instant::now() + budget;
-        while Instant::now() < deadline {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_default();
-            let wait = remaining.min(Duration::from_millis(20));
-            match self.rx.recv_timeout(wait) {
-                Ok(bytes) => {
-                    self.parser.process(&bytes);
-                    // drain anything already queued without extra waiting
-                    while let Ok(more) = self.rx.try_recv() {
-                        self.parser.process(&more);
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
+    /// Current visible frame (no waiting).
+    pub fn snapshot(&self) -> Frame {
+        frame_from_screen(&self.term.screen(), self.provenance.clone())
     }
 
-    /// Send raw bytes (text + `\r` for Enter).
-    pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()?;
-        Ok(())
-    }
-
-    /// Send one named key. Covers the keys tcc `capture.sh keys/mouse` uses.
+    /// Send one named key: `enter escape tab backtab backspace insert delete
+    /// up down left right home end pageup pagedown space f1..f12 ctrl-x alt-x`,
+    /// or `text:<literal>`.
     pub fn send_key(&mut self, name: &str) -> Result<()> {
-        let seq: &[u8] = match name {
-            "enter" => b"\r",
-            "escape" | "esc" => b"\x1b",
-            "tab" => b"\t",
-            "backtab" => b"\x1b[Z",
-            "backspace" => b"\x7f",
-            "up" => b"\x1b[A",
-            "down" => b"\x1b[B",
-            "right" => b"\x1b[C",
-            "left" => b"\x1b[D",
-            "home" => b"\x1b[H",
-            "end" => b"\x1b[F",
-            "pageup" => b"\x1b[5~",
-            "pagedown" => b"\x1b[6~",
-            "space" => b" ",
-            s if s.starts_with("ctrl-") && s.len() == 6 => {
-                let c = s.as_bytes()[5];
-                let code = if c.is_ascii_lowercase() {
-                    c - b'a' + 1
-                } else {
-                    anyhow::bail!("bad ctrl key: {name}");
-                };
-                self.send(&[code])?;
-                return Ok(());
+        use termlens::Key;
+        if let Some(text) = name.strip_prefix("text:") {
+            return Ok(self.term.send_str(text)?);
+        }
+        let key = match name {
+            "enter" => Key::Enter,
+            "escape" | "esc" => Key::Esc,
+            "tab" => Key::Tab,
+            "backtab" => Key::BackTab,
+            "backspace" => Key::Backspace,
+            "insert" => Key::Insert,
+            "delete" => Key::Delete,
+            "up" => Key::Up,
+            "down" => Key::Down,
+            "left" => Key::Left,
+            "right" => Key::Right,
+            "home" => Key::Home,
+            "end" => Key::End,
+            "pageup" => Key::PageUp,
+            "pagedown" => Key::PageDown,
+            "space" => Key::Char(' '),
+            // Single printable characters first: "f" is a letter, "f5" is F5.
+            s if s.chars().count() == 1 => Key::Char(s.chars().next().unwrap_or(' ')),
+            s if s.starts_with('f') && (2..=3).contains(&s.len()) => {
+                let n: u8 = s[1..]
+                    .parse()
+                    .with_context(|| format!("bad function key: {name}"))?;
+                anyhow::ensure!((1..=12).contains(&n), "bad function key: {name}");
+                Key::F(n)
             }
-            s if s.starts_with("text:") => {
-                let t = s["text:".len()..].to_owned();
-                self.send(t.as_bytes())?;
-                return Ok(());
-            }
-            _ => anyhow::bail!(
-                "unknown key: {name} (enter|escape|tab|backtab|up|down|left|right|space|ctrl-x|text:..)"
-            ),
+            s if s.starts_with("ctrl-") && s.len() == 6 => Key::Ctrl(s.as_bytes()[5] as char),
+            s if s.starts_with("alt-") && s.len() == 5 => Key::Alt(s.as_bytes()[4] as char),
+            _ => anyhow::bail!("unknown key: {name}"),
         };
-        self.send(seq)
+        Ok(self.term.send(key)?)
     }
 
-    /// Wait until screen text contains `needle` or timeout.
-    pub fn wait_for_text(&mut self, needle: &str, timeout: Duration) -> Result<bool> {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            self.pump(Duration::from_millis(50));
-            if self.frame().text().contains(needle) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    /// Type literal text (no key interpretation).
+    pub fn type_text(&mut self, text: &str) -> Result<()> {
+        Ok(self.term.send_str(text)?)
     }
 
-    /// Settle: no new bytes for `idle` within `timeout` (cellshot `waitForIdle`).
-    pub fn wait_for_idle(&mut self, idle: Duration, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        let mut last_change = Instant::now();
-        let mut last_text = self.frame().text();
-        while Instant::now() < deadline {
-            self.pump(Duration::from_millis(50));
-            let t = self.frame().text();
-            if t != last_text {
-                last_text = t;
-                last_change = Instant::now();
-            }
-            if last_change.elapsed() >= idle {
-                return Ok(());
-            }
-        }
-        Ok(())
+    /// Bracketed paste.
+    pub fn paste(&mut self, text: &str) -> Result<()> {
+        Ok(self.term.paste(text)?)
     }
 
-    /// Current visible frame.
+    /// Left-click at `(col, row)`.
+    pub fn click(&mut self, col: u16, row: u16) -> Result<()> {
+        Ok(self.term.click(col, row)?)
+    }
+
+    /// Drag with the primary button from `(c0, r0)` to `(c1, r1)`.
+    pub fn drag(&mut self, c0: u16, r0: u16, c1: u16, r1: u16) -> Result<()> {
+        Ok(self
+            .term
+            .drag(termlens::MouseButton::Left, (c0, r0), (c1, r1))?)
+    }
+
+    /// Resize the viewport (bounded by termlens to 2..=1000 per axis).
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        Ok(self.term.resize(cols, rows)?)
+    }
+
+    /// Fail unless the screen contains `needle` before the deadline.
+    /// Timeout errors embed the screen at timeout (failure evidence).
+    pub fn wait_for_text(&mut self, needle: &str) -> Result<()> {
+        Ok(self.term.wait_until(|s| s.text().contains(needle))?)
+    }
+
+    /// Fail unless the full screen (content AND styles) is stable for `quiet`.
+    /// Prefer over text-only idle: color/cursor-only activity resets it.
+    pub fn wait_stable(&mut self, quiet: Duration) -> Result<Frame> {
+        let screen = self.term.wait_stable(quiet)?;
+        Ok(frame_from_screen(&screen, self.provenance.clone()))
+    }
+
+    /// Fail unless output is quiet for `quiet` (fallback when no predicate).
+    pub fn wait_idle(&mut self, quiet: Duration) -> Result<()> {
+        Ok(self.term.wait_idle(quiet)?)
+    }
+
+    /// Fail unless the child exits; returns its status.
+    pub fn wait_exit(&mut self) -> Result<termlens::ExitStatus> {
+        Ok(self.term.wait_exit()?)
+    }
+
+    /// The spawned command line (for provenance/diagnostics).
     #[must_use]
-    pub fn frame(&self) -> Frame {
-        Frame::from_vt100(self.parser.screen())
-    }
-
-    /// Settle then snapshot.
-    pub fn snapshot(&mut self) -> Frame {
-        self.pump(self.opts.settle);
-        self.frame()
-    }
-
-    /// Kill the child (one-shot `run` cleanup; named `stop` = roadmap).
-    pub fn stop(mut self) -> Result<()> {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        Ok(())
+    pub fn argv(&self) -> &[String] {
+        &self.argv
     }
 }
 
-/// One-shot: spawn, optionally send keys + wait, settle, return frame.
-/// `sends`: `text:<..>` / key names / `sleep:<ms>` / `wait:<needle>`.
-pub fn run_once(argv: &[String], opts: &PtyOptions, sends: &[String]) -> Result<Frame> {
-    let mut s = PtySession::spawn(argv, opts.clone())?;
-    s.pump(Duration::from_millis(300));
+/// One-shot scripted capture: spawn, run `sends` steps, settle, snapshot.
+///
+/// Steps: `type:<text>`, `sleep:<ms>`, `wait:<needle>`, anything else is a
+/// [`Session::send_key`] name. Every wait fails the run on timeout — a
+/// scenario never continues past a screen that never appeared.
+pub fn run_once(
+    argv: &[String],
+    opts: &PtyOptions,
+    sends: &[String],
+    settle: Duration,
+) -> Result<Frame> {
+    let mut s = Session::spawn(argv, opts)?;
+    s.wait_idle(Duration::from_millis(200))?;
     for step in sends {
         if let Some(ms) = step.strip_prefix("sleep:") {
             let ms: u64 = ms.parse().context("sleep:<ms>")?;
             std::thread::sleep(Duration::from_millis(ms));
         } else if let Some(needle) = step.strip_prefix("wait:") {
-            s.wait_for_text(needle, opts.timeout)?;
+            s.wait_for_text(needle)?;
         } else if let Some(text) = step.strip_prefix("type:") {
-            s.send(text.as_bytes())?;
+            s.type_text(text)?;
             std::thread::sleep(Duration::from_millis(120));
         } else {
             s.send_key(step)?;
             std::thread::sleep(Duration::from_millis(120));
         }
-        s.pump(Duration::from_millis(100));
     }
-    s.wait_for_idle(Duration::from_millis(200), opts.timeout)?;
-    let f = s.snapshot();
-    let _ = s.stop();
-    Ok(f)
+    s.wait_stable(settle)?;
+    Ok(s.snapshot())
 }

@@ -25,6 +25,8 @@ for the full head-to-head comparison.
 - https://github.com/charmbracelet/freeze — publication-quality PNG/SVG/WebP of code and terminal output (themes, fonts, window chrome).
 - https://github.com/homeport/termshot — PNG screenshots from ANSI output.
 - https://github.com/pamburus/termframe — Rust terminal-output → SVG screenshot tool.
+- https://github.com/russmckendrick/terminal-svg — Rust terminal emulation + SVG with embedded WOFF2 font subsets and source metadata for re-rendering (distinct from termframe).
+- https://github.com/reg-viz/reg-cli — image-comparison + HTML report workflow (3-dir contract mirrored natively by tuisnap; needs Node).
 
 ## Session record / demo (motion)
 

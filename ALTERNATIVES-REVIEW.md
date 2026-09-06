@@ -1,5 +1,27 @@
 # Alternatives review: TUI snapshot / capture tools vs `tuisnap`
 
+## v0.2 update (verified Sept 2026 — supersedes the tuisnap column below)
+
+- `tuisnap` v0.2 reuses: `termlens` 0.9 as the PTY engine (sync, pure-cargo,
+  `Drop` kills the child, style-aware `wait_stable`), `vt100` 0.16 for raw
+  replay (it HAS `dim` — the old "no dim" claim was wrong), `fontdue` 0.9.4
+  for real-glyph PNG, `image-compare` 0.5.0 for pixel gates.
+- Rejected as dependencies (verified): `terminal-control` 1.2.1
+  (`c1d4f95e`) needs Rust 1.93 + **Zig 0.15.2** + network at build time
+  (unconditional `libghostty-vt`) — incompatible with pure-cargo CI; its
+  public frame model informed our schema only. `resvg` defaults to system
+  fonts (breaks pinning) and outweighs direct cell rasterization. `reg-cli`
+  needs Node — its 3-dir + HTML contract is mirrored natively instead.
+- Corrections to the matrix below: `terminal-svg` is
+  `russmckendrick/terminal-svg` (Rust, WOFF2-subset + source-metadata
+  embeds), NOT another name for `pamburus/termframe`. `cellshot` moved to
+  `anomalyco/terminal-control`. `termlens` 0.9 is far more than minimal
+  (waits, assertions, cursor/mode inspection, insta macros).
+- v0.2 closes the old gaps: real glyphs (no blocks), full approved
+  frames+images (no hash-only), explicit `accept` (no `BLESS`), portable
+  HTML with embedded PNGs + frame JSON, style-aware waits that fail on
+  timeout, `--font-file` on all gates.
+
 Scope: alternatives to **this project** — `tuisnap` v0.1.0 in this workspace
 (Rust CLI + crate: real-PTY black-box capture AND in-process Ratatui headless
 dumps, exporting `txt/ansi/json/svg/html/png`, with FNV-1a digest baselines).

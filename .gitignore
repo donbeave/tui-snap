@@ -1,2 +1,9 @@
 /target/
 .opencode/
+# Local visual evidence (regenerable): actuals, diffs, reports, and approved
+# PNGs (byte-identical regeneration from approved frame.json is proven by
+# tests). Only approved/*.frame.json is committed.
+tests/visual/actual/
+tests/visual/diff/
+tests/visual/report.html
+tests/visual/approved/*.png

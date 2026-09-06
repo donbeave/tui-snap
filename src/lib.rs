@@ -1,24 +1,29 @@
-//! tuisnap: capture any TUI to reviewable snapshots, and dump Ratatui views headlessly.
+//! tuisnap: Rust TUI visual-regression toolkit.
 //!
-//! Two surfaces, one artifact model:
-//! - **Black-box PTY** (`pty`): spawn any binary in a real pty (no tmux needed),
-//!   drive it with keys/text, wait for text/idle, read the visible [`Frame`].
-//! - **In-process Ratatui** (`ratatui_shot`): render a `Widget` into a
-//!   `TestBackend` and convert the buffer into the same [`Frame`].
+//! Two capture paths share one canonical [`Frame`]:
+//! - **Pure view tests** ([`ratatui`]): fixture model + view state +
+//!   viewport + theme → the actual production Ratatui view → frame. No
+//!   business logic, network, database, or PTY.
+//! - **Interactive tests** ([`pty`], feature `pty`): the real executable in a
+//!   real PTY (termlens engine), keyboard/mouse/resize, readiness waits that
+//!   fail on timeout → frame.
 //!
-//! A [`Frame`] exports `txt / ansi / json / svg / html / png` via [`render`],
-//! and is pinned by an FNV-1a [`digest`] checked into a [`Baseline`] file
-//! (`BLESS=1` to regenerate, like `UPDATE_EXPECT=1` / `cargo-insta`).
+//! Both produce full approved frames + readable PNGs and portable HTML
+//! expected/actual/diff reports ([`snapshot`]). A changed snapshot requires
+//! explicit review ([`snapshot::Store::accept`]); CI never auto-blesses.
+//! Equality only validates the fixtures covered — not every app state.
 
-pub mod ansi;
-pub mod baseline;
-pub mod digest;
+pub mod diff;
 pub mod frame;
-pub mod pty;
-pub mod ratatui_shot;
+pub mod profile;
+pub mod ratatui;
 pub mod render;
+pub mod snapshot;
 
-pub use baseline::Baseline;
-pub use digest::digest_frame;
-pub use frame::{Cell, Color, Frame};
-pub use pty::{PtyOptions, PtySession, WaitFor};
+#[cfg(feature = "pty")]
+pub mod ansi;
+#[cfg(feature = "pty")]
+pub mod pty;
+
+pub use frame::{Cell, Color, Cursor, CursorStyle, Frame, FrameError, Mods, Provenance, Rgb};
+pub use profile::{Profile, VENDORED_FONT};
