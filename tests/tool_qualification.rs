@@ -163,3 +163,26 @@ fn formatted_terminal_modes_preserve_autowrap_disable_and_restore() {
     replay.process(b"D");
     assert_eq!(replay.screen().cell(1, 0).unwrap().contents(), "D");
 }
+
+#[cfg(feature = "pty")]
+#[test]
+fn right_margin_cursor_is_physical_without_losing_pending_wrap() {
+    for mode in [b"\x1b[?7l".as_slice(), b"\x1b[?7h".as_slice()] {
+        let mut bytes = mode.to_vec();
+        bytes.extend_from_slice(b"\x1b[1;8HA");
+        let f = tuisnap::ansi::replay_raw(&bytes, 8, 3, 0, prov()).unwrap();
+        assert_eq!((f.cursor.x, f.cursor.y), (7, 0));
+        bytes.extend_from_slice("\u{301}".as_bytes());
+        let f = tuisnap::ansi::replay_raw(&bytes, 8, 3, 0, prov()).unwrap();
+        assert_eq!(f.get(7, 0).unwrap().symbol, "A\u{301}");
+        bytes.push(b'B');
+        let f = tuisnap::ansi::replay_raw(&bytes, 8, 3, 0, prov()).unwrap();
+        if mode.ends_with(b"h") {
+            assert_eq!(f.get(0, 1).unwrap().symbol, "B");
+            assert_eq!((f.cursor.x, f.cursor.y), (1, 1));
+        } else {
+            assert_eq!(f.get(7, 0).unwrap().symbol, "B");
+            assert_eq!((f.cursor.x, f.cursor.y), (7, 0));
+        }
+    }
+}

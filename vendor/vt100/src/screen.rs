@@ -493,7 +493,9 @@ impl Screen {
     #[must_use]
     pub fn cursor_position(&self) -> (u16, u16) {
         let pos = self.grid().pos();
-        (pos.row, pos.col)
+        // The grid may retain a pending-wrap column equal to its width.
+        // That is parser state, not a physical cursor outside the terminal.
+        (pos.row, pos.col.min(self.grid().size().cols.saturating_sub(1)))
     }
 
     /// Returns terminal escape sequences sufficient to set the current
