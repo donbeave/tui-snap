@@ -1,4 +1,4 @@
-//! Canonical frame schema (v2): the single artifact both capture paths share.
+//! Canonical frame schema (v3): the single artifact both capture paths share.
 //!
 //! ```text
 //! fixture model + view state + viewport + theme ──▶ production Ratatui view ──▶ Frame
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Schema version. Bump on any incompatible change and migrate readers.
-pub const FRAME_VERSION: u8 = 2;
+pub const FRAME_VERSION: u8 = 3;
 
 /// Maximum viewport dimension accepted on import (DoS bound).
 pub const MAX_DIM: u16 = 512;
@@ -86,15 +86,13 @@ pub enum Color {
     Rgb(Rgb),
 }
 
-/// Supported cell modifiers. Blink phase and concealment are intentionally
-/// absent: a frozen frame renders blink as visible. Ratatui
-/// `SLOW_BLINK`/`RAPID_BLINK` therefore collapse to unmarked (documented
-/// loss), and Ratatui `HIDDEN` is UNSUPPORTED — cells styled HIDDEN render
-/// visibly and must be covered by separate assertions, never by a screenshot
-/// gate. Hyperlink targets, kitty image payloads, and blink phase likewise
-/// belong in additional assertions, not in this contract.
+/// Cell modifiers retained in canonical data. Blink phase is frozen visible;
+/// hidden glyphs are omitted by renderers but their source symbols remain in
+/// canonical data. Concealment is not redaction: never capture real secrets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Mods {
+    pub hidden: bool,
+    pub blink: bool,
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
@@ -517,7 +515,7 @@ impl Frame {
         }
         if cell.mods.dim {
             // 60% fg over bg (matches common terminal dim treatment).
-            let mix = |f: u8, b: u8| (f as u32 * 6 + b as u32 * 4) as u8 / 10;
+            let mix = |f: u8, b: u8| ((u32::from(f) * 6 + u32::from(b) * 4) / 10) as u8;
             fg = Rgb::new(mix(fg.r, bg.r), mix(fg.g, bg.g), mix(fg.b, bg.b));
         }
         (fg, bg)

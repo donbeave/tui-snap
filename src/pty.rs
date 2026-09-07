@@ -63,7 +63,20 @@ pub fn frame_from_screen(screen: &termlens::Screen, provenance: Provenance) -> F
                 continue;
             };
             if tc.is_wide_continuation() {
+                let st = tc.style();
                 let mut cont = Cell::blank(c, r);
+                cont.fg = convert_color(st.fg);
+                cont.bg = convert_color(st.bg);
+                cont.mods = Mods {
+                    bold: st.bold,
+                    dim: st.dim,
+                    italic: st.italic,
+                    underline: st.underline,
+                    strikethrough: st.strikethrough,
+                    reverse: st.reverse,
+                    hidden: st.conceal,
+                    blink: st.blink,
+                };
                 cont.width = 0;
                 cont.continuation = true;
                 cont.symbol = String::new();
@@ -85,6 +98,8 @@ pub fn frame_from_screen(screen: &termlens::Screen, provenance: Provenance) -> F
                 fg: convert_color(st.fg),
                 bg: convert_color(st.bg),
                 mods: Mods {
+                    hidden: st.conceal,
+                    blink: st.blink,
                     bold: st.bold,
                     dim: st.dim,
                     italic: st.italic,
@@ -200,6 +215,23 @@ impl Session {
     /// Bracketed paste.
     pub fn paste(&mut self, text: &str) -> Result<()> {
         Ok(self.term.paste(text)?)
+    }
+
+    /// Send a bracketed paste preserving literal newlines.
+    ///
+    /// Unlike [`Self::paste`], this does not emulate terminal newline conversion.
+    /// Fails unless bracketed paste is enabled, or if the payload contains paste
+    /// delimiters: such text could escape the bracket and become ordinary input.
+    pub fn paste_literal(&mut self, text: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.term.screen().bracketed_paste(),
+            "bracketed paste is not enabled"
+        );
+        anyhow::ensure!(
+            !text.contains("\x1b[200~") && !text.contains("\x1b[201~"),
+            "payload contains paste delimiter"
+        );
+        Ok(self.term.send_str(&format!("\x1b[200~{text}\x1b[201~"))?)
     }
 
     /// Left-click at `(col, row)`.

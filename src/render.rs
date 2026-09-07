@@ -12,7 +12,7 @@
 //! - faux-bold via double-strike, faux-italic via shear (documented
 //!   approximations; the cell data stays authoritative for styles);
 //! - underline / strikethrough drawn at fixed offsets from the baseline;
-//! - blink frozen as visible; concealment unsupported (see [`crate::frame`]).
+//! - blink frozen as visible; concealed glyphs omitted (see [`crate::frame`]).
 
 use crate::frame::{Frame, Rgb};
 use crate::profile::Profile;
@@ -230,7 +230,7 @@ pub fn render_png(
             if cbg != profile.default_bg {
                 fill_rect(&mut img, cx, cy, span, profile.cell_h, cbg);
             }
-            if cell.symbol.trim().is_empty() {
+            if cell.mods.hidden || cell.symbol.trim().is_empty() {
                 continue;
             }
             let baseline = cy as i32 + loaded.ascent.round() as i32;
@@ -283,7 +283,7 @@ pub fn render_png(
             match style {
                 crate::frame::CursorStyle::Block => {
                     fill_rect(&mut img, px, py, span, profile.cell_h, fg);
-                    if !cell.symbol.trim().is_empty() {
+                    if !cell.mods.hidden && !cell.symbol.trim().is_empty() {
                         let baseline = py as i32 + loaded.ascent.round() as i32;
                         draw_symbol(
                             &mut img,
@@ -388,7 +388,11 @@ pub fn render_svg(frame: &Frame, profile: &Profile) -> String {
                 {
                     break;
                 }
-                run.push_str(&c.symbol);
+                if c.mods.hidden {
+                    run.push_str(&" ".repeat(usize::from(c.width.max(1))));
+                } else {
+                    run.push_str(&c.symbol);
+                }
                 // Advance by display width (wide cells occupy 2 columns but
                 // hold one grapheme in the lead cell).
                 nx += u16::from(c.width.max(1));
@@ -456,6 +460,12 @@ pub fn ansi_dump(frame: &Frame) -> String {
 
 fn sgr_for(c: &crate::frame::Cell) -> String {
     let mut p: Vec<String> = Vec::new();
+    if c.mods.hidden {
+        p.push("8".into());
+    }
+    if c.mods.blink {
+        p.push("5".into());
+    }
     if c.mods.bold {
         p.push("1".into());
     }

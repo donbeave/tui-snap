@@ -39,3 +39,6 @@ vt100 = { version = "0.16", optional = true }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
 tempfile = "3"
+
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }

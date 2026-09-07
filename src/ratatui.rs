@@ -52,6 +52,8 @@ fn convert_color(c: ratatui::style::Color) -> Color {
 
 fn convert_mods(m: Modifier) -> Mods {
     Mods {
+        hidden: m.contains(Modifier::HIDDEN),
+        blink: m.intersects(Modifier::SLOW_BLINK | Modifier::RAPID_BLINK),
         bold: m.contains(Modifier::BOLD),
         dim: m.contains(Modifier::DIM),
         italic: m.contains(Modifier::ITALIC),
@@ -105,6 +107,9 @@ pub fn from_buffer(
             // Ratatui marks wide-cell followers with an empty symbol.
             if rc.symbol().is_empty() {
                 let mut cont = Cell::blank(x, y);
+                cont.fg = convert_color(rc.fg);
+                cont.bg = convert_color(rc.bg);
+                cont.mods = convert_mods(rc.modifier);
                 cont.width = 0;
                 cont.continuation = true;
                 cont.symbol = String::new();
@@ -127,6 +132,9 @@ pub fn from_buffer(
             frame.set(lead);
             if w == 2 && x + 1 < cols {
                 let mut cont = Cell::blank(x + 1, y);
+                cont.fg = convert_color(rc.fg);
+                cont.bg = convert_color(rc.bg);
+                cont.mods = convert_mods(rc.modifier);
                 cont.width = 0;
                 cont.continuation = true;
                 cont.symbol = String::new();
