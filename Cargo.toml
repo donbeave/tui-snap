@@ -32,13 +32,10 @@ serde_json = "1"
 sha2 = "0.11"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 unicode-width = "0.2"
-termlens = { version = "0.9", optional = true }
-vt100 = { version = "0.16", optional = true }
+termlens = { version = "0.9", path = "vendor/termlens", optional = true }
+vt100 = { version = "0.16", path = "vendor/vt100", optional = true }
 
 [dev-dependencies]
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
 tempfile = "3"
-
-[patch.crates-io]
-vt100 = { path = "vendor/vt100" }

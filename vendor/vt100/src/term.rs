@@ -238,9 +238,18 @@ impl BufWrite for Attrs {
         if let Some(intensity) = self.intensity {
             match intensity {
                 Intensity::Normal => write_param!(22),
-                Intensity::Bold => { write_param!(22); write_param!(1); },
-                Intensity::Dim => { write_param!(22); write_param!(2); },
-                Intensity::BoldDim => { write_param!(1); write_param!(2); },
+                Intensity::Bold => {
+                    write_param!(22);
+                    write_param!(1);
+                }
+                Intensity::Dim => {
+                    write_param!(22);
+                    write_param!(2);
+                }
+                Intensity::BoldDim => {
+                    write_param!(1);
+                    write_param!(2);
+                }
             }
         }
 
@@ -375,10 +384,8 @@ impl BufWrite for MoveFromTo {
     fn write_buf(&self, buf: &mut Vec<u8>) {
         if self.to.row == self.from.row + 1 && self.to.col == 0 {
             crate::term::Crlf.write_buf(buf);
-        } else if self.from.row == self.to.row && self.from.col < self.to.col
-        {
-            crate::term::MoveRight::new(self.to.col - self.from.col)
-                .write_buf(buf);
+        } else if self.from.row == self.to.row && self.from.col < self.to.col {
+            crate::term::MoveRight::new(self.to.col - self.from.col).write_buf(buf);
         } else if self.to != self.from {
             crate::term::MoveTo::new(self.to).write_buf(buf);
         }
@@ -459,10 +466,7 @@ pub struct MouseProtocolMode {
 }
 
 impl MouseProtocolMode {
-    pub fn new(
-        mode: crate::MouseProtocolMode,
-        prev: crate::MouseProtocolMode,
-    ) -> Self {
+    pub fn new(mode: crate::MouseProtocolMode, prev: crate::MouseProtocolMode) -> Self {
         Self { mode, prev }
     }
 }
@@ -513,10 +517,7 @@ pub struct MouseProtocolEncoding {
 }
 
 impl MouseProtocolEncoding {
-    pub fn new(
-        encoding: crate::MouseProtocolEncoding,
-        prev: crate::MouseProtocolEncoding,
-    ) -> Self {
+    pub fn new(encoding: crate::MouseProtocolEncoding, prev: crate::MouseProtocolEncoding) -> Self {
         Self { encoding, prev }
     }
 }

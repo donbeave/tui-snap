@@ -1,4 +1,5 @@
 /target/
+tests/fixtures/*/target/
 .opencode/
 # Local visual evidence (regenerable): actuals, diffs, reports, and approved
 # PNGs (byte-identical regeneration from approved frame.json is proven by

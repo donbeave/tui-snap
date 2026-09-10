@@ -25,5 +25,10 @@ pub mod ansi;
 #[cfg(feature = "pty")]
 pub mod pty;
 
+/// The pinned PTY engine, re-exported for callers constructing screens for
+/// [`pty::frame_from_screen`]. Git/path consumers need no Cargo patches.
+#[cfg(feature = "pty")]
+pub use termlens;
+
 pub use frame::{Cell, Color, Cursor, CursorStyle, Frame, FrameError, Mods, Provenance, Rgb};
 pub use profile::{Profile, VENDORED_FONT};

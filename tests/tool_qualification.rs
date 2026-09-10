@@ -3,6 +3,52 @@ use tuisnap::{Cell, Color, Frame, Profile, Provenance, Rgb, VENDORED_FONT};
 fn prov() -> Provenance {
     Provenance::now("qualification", "fixture", vec![])
 }
+
+#[test]
+fn hidden_svg_cells_keep_whitespace_geometry() {
+    let mut frame = Frame::blank(4, 2, prov());
+    for (i, symbol) in ["H", "A", "H", "B"].into_iter().enumerate() {
+        frame.cells[i].symbol = symbol.into();
+        frame.cells[i].mods.hidden = i % 2 == 0;
+    }
+    let svg = tuisnap::render::render_svg(&frame, &Profile::default_profile());
+    assert!(svg.contains("xml:space=\"preserve\""));
+    assert!(svg.contains("> A B</text>"));
+    assert!(!svg.contains('H'));
+}
+
+#[cfg(feature = "pty")]
+#[test]
+fn serialized_contents_restore_wrap_before_painting() {
+    for target_disabled in [false, true] {
+        let mut before = vt100::Parser::new(3, 8, 0);
+        before.process(b"\x1b[?7l");
+        let mut after = vt100::Parser::new(3, 8, 0);
+        after.process(b"ABCDEFGHIJ");
+        if target_disabled {
+            after.process(b"\x1b[?7l");
+        }
+        for delta in [false, true] {
+            let encoded = if delta {
+                after.screen().state_diff(before.screen())
+            } else {
+                after.screen().state_formatted()
+            };
+            let mut replay = vt100::Parser::new(3, 8, 0);
+            replay.process(&before.screen().state_formatted());
+            replay.process(&encoded);
+            assert_eq!(replay.screen().contents(), after.screen().contents());
+            assert_eq!(
+                replay.screen().cursor_position(),
+                after.screen().cursor_position()
+            );
+            assert_eq!(
+                replay.screen().input_mode_formatted(),
+                after.screen().input_mode_formatted()
+            );
+        }
+    }
+}
 #[test]
 fn dim_blending_uses_full_precision_before_narrowing() {
     for fg in 0..=255u8 {

@@ -6,9 +6,11 @@ is frozen visible and slow/rapid rates remain combined. HIDDEN suppresses
 PNG/SVG glyph paint, while canonical JSON retains the original symbol: hidden
 text is not redacted. Never capture real secrets.
 
-`tools/migrate_fixture_v3.py --out DIR` exports only the repository's audited
-fixture approvals, tied to the exact unchanged fixture source hash. No actual
-capture is read. `--continuation-styles` additionally repairs old continuation
+`python3 tools/migrate_fixture_v3.py --out DIR` exports only the audited
+schema-2 approvals read directly from Git revision
+`5036cf87e621e6beb66deffe3224abdbefc955cb`, tied to the exact fixture source hash.
+Run from a checkout containing that revision; current schema-3 approvals and
+actual captures are never read. `--continuation-styles` additionally repairs old continuation
 colors/modifiers from each original wide lead; its ledger lists these changes
 separately. Outputs require review before replacing approved files. This is
 not a general migration of arbitrary schema-2 snapshots: unknown hidden/blink
@@ -18,9 +20,17 @@ The vendored vt100 0.16.2 source fixes independent bold/DIM flags, DECAWM,
 wide continuation attributes, and hidden/blink/strike support. Archive and
 original per-file hashes are in `vendor/UPSTREAM.json`; full licensed source
 is included so a clean checkout builds without a developer-machine patch.
-Cargo uses the repository-level `[patch.crates-io]`. External consumers must
-repeat that patch in their workspace root; Cargo ignores dependency-local
-patch sections. Record `cargo tree -i vt100` when qualifying a consumer.
+The unmodified termlens 0.9 library is also vendored, with its vt100 dependency
+wired to that same local engine. Both are direct path dependencies: Git/path
+consumers need no `[patch.crates-io]` workaround. Original source hashes and
+licenses are retained in `vendor/TERMLENS-UPSTREAM.json` and `vendor/termlens`.
+Code using `frame_from_screen` should construct its screen through the
+`tuisnap::termlens` re-export so the engine's Rust type identity matches.
+Qualify ordinary consumption with `cargo run --locked --manifest-path
+tests/fixtures/consumer/Cargo.toml` and inspect `cargo tree -i vt100` in that
+consumer. A future crates.io release must publish the forked engine packages
+under distinct names before replacing these Git/path dependencies; this PR
+does not silently fall back to the defective registry engine.
 
 `Session::paste` retains termlens's simulated terminal behavior (LF→CR plus
 paste-marker sanitization). `Session::paste_literal` preserves literal line

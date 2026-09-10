@@ -181,11 +181,17 @@ impl Cell {
 impl Cell {
     /// Whether the cell carries the hidden SGR attribute.
     #[must_use]
-    pub fn hidden(&self) -> bool { self.attrs.hidden() }
+    pub fn hidden(&self) -> bool {
+        self.attrs.hidden()
+    }
     /// Whether the cell carries the blink SGR attribute.
     #[must_use]
-    pub fn blink(&self) -> bool { self.attrs.blink() }
+    pub fn blink(&self) -> bool {
+        self.attrs.blink()
+    }
     /// Whether the cell carries the strikethrough SGR attribute.
     #[must_use]
-    pub fn strikethrough(&self) -> bool { self.attrs.strikethrough() }
+    pub fn strikethrough(&self) -> bool {
+        self.attrs.strikethrough()
+    }
 }

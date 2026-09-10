@@ -92,26 +92,40 @@ impl Attrs {
         }
     }
 
-    pub fn blink(&self) -> bool { self.mode & TEXT_MODE_BLINK != 0 }
+    pub fn blink(&self) -> bool {
+        self.mode & TEXT_MODE_BLINK != 0
+    }
     pub fn set_blink(&mut self, value: bool) {
-        if value { self.mode |= TEXT_MODE_BLINK; } else { self.mode &= !TEXT_MODE_BLINK; }
+        if value {
+            self.mode |= TEXT_MODE_BLINK;
+        } else {
+            self.mode &= !TEXT_MODE_BLINK;
+        }
     }
 
-    pub fn hidden(&self) -> bool { self.mode & TEXT_MODE_HIDDEN != 0 }
+    pub fn hidden(&self) -> bool {
+        self.mode & TEXT_MODE_HIDDEN != 0
+    }
     pub fn set_hidden(&mut self, value: bool) {
-        if value { self.mode |= TEXT_MODE_HIDDEN; } else { self.mode &= !TEXT_MODE_HIDDEN; }
+        if value {
+            self.mode |= TEXT_MODE_HIDDEN;
+        } else {
+            self.mode &= !TEXT_MODE_HIDDEN;
+        }
     }
 
-    pub fn strikethrough(&self) -> bool { self.mode & TEXT_MODE_STRIKE != 0 }
+    pub fn strikethrough(&self) -> bool {
+        self.mode & TEXT_MODE_STRIKE != 0
+    }
     pub fn set_strikethrough(&mut self, value: bool) {
-        if value { self.mode |= TEXT_MODE_STRIKE; } else { self.mode &= !TEXT_MODE_STRIKE; }
+        if value {
+            self.mode |= TEXT_MODE_STRIKE;
+        } else {
+            self.mode &= !TEXT_MODE_STRIKE;
+        }
     }
 
-    pub fn write_escape_code_diff(
-        &self,
-        contents: &mut Vec<u8>,
-        other: &Self,
-    ) {
+    pub fn write_escape_code_diff(&self, contents: &mut Vec<u8>, other: &Self) {
         if self != other && self == &Self::default() {
             crate::term::ClearAttrs.write_buf(contents);
             return;
@@ -158,11 +172,28 @@ impl Attrs {
 
         attrs.write_buf(contents);
         for (changed, enabled, on, off) in [
-            (self.blink() != other.blink(), self.blink(), b"\x1b[5m".as_slice(), b"\x1b[25m".as_slice()),
-            (self.hidden() != other.hidden(), self.hidden(), b"\x1b[8m".as_slice(), b"\x1b[28m".as_slice()),
-            (self.strikethrough() != other.strikethrough(), self.strikethrough(), b"\x1b[9m".as_slice(), b"\x1b[29m".as_slice()),
+            (
+                self.blink() != other.blink(),
+                self.blink(),
+                b"\x1b[5m".as_slice(),
+                b"\x1b[25m".as_slice(),
+            ),
+            (
+                self.hidden() != other.hidden(),
+                self.hidden(),
+                b"\x1b[8m".as_slice(),
+                b"\x1b[28m".as_slice(),
+            ),
+            (
+                self.strikethrough() != other.strikethrough(),
+                self.strikethrough(),
+                b"\x1b[9m".as_slice(),
+                b"\x1b[29m".as_slice(),
+            ),
         ] {
-            if changed { contents.extend_from_slice(if enabled { on } else { off }); }
+            if changed {
+                contents.extend_from_slice(if enabled { on } else { off });
+            }
         }
     }
 }

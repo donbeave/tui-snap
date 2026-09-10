@@ -419,7 +419,7 @@ pub fn render_svg(frame: &Frame, profile: &Profile) -> String {
             };
             let attrs = format!("{weight}{style}");
             s.push_str(&format!(
-                "<text x=\"{px}\" y=\"{}\" fill=\"{}\"{}>{}</text>\n",
+                "<text xml:space=\"preserve\" x=\"{px}\" y=\"{}\" fill=\"{}\"{}>{}</text>\n",
                 py + ch - 4,
                 fg0.to_hex(),
                 attrs,
