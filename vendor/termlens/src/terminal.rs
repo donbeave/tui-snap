@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 
-use crate::emu::{Emulator, InputModes, MouseEncoding, Query, Stop, Vt100Emulator};
+use crate::emu::{Emulator, InputModes, MouseEncoding, Query, Stop, TermpaneEmulator};
 use crate::error::{Error, Result};
 use crate::keys::Input;
 use crate::keys::{mouse_legacy, mouse_sgr, mouse_utf8};
@@ -125,7 +125,7 @@ impl FrameTiming {
 /// that commits completed blocks into native scrollback and keeps a small
 /// live region — has content that simply ceases to exist without this.
 ///
-/// It costs nothing where it is not used. vt100 gives the alternate screen
+/// It costs nothing where it is not used. The grid gives the alternate screen
 /// zero scrollback of its own, so a full-screen TUI that switches to the
 /// alt screen never accumulates history, and a retained row is one shared
 /// string rather than a grid of cells.
@@ -1562,7 +1562,7 @@ impl TerminalBuilder {
         // memory bound instead of on a queue-slot count.
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(Monitor::new(EmuState::new(
-            Box::new(Vt100Emulator::new(
+            Box::new(TermpaneEmulator::new(
                 self.rows,
                 self.cols,
                 self.scrollback,
@@ -1840,24 +1840,22 @@ fn pixel_span(cells: u16, per_cell: Option<u16>) -> u16 {
 
 /// Reject a terminal size that cannot work, or cannot work usefully.
 ///
-/// Letting a zero reach the emulator is not a graceful degradation: in
-/// debug builds vt100 panics on an overflowing subtraction, and in release
-/// builds (the stress workflow runs `--release`) the arithmetic wraps,
-/// `spawn` and `resize` return `Ok`, and vt100 panics on the first
-/// printable byte — on the reader thread, where nothing propagates it. The
-/// drain dies silently, every later snapshot is blank, and a careless test
-/// goes green. Zeroes arrive from ordinary arithmetic (`resize(cols - 1, …)`
-/// in a loop), so this must be a typed error, not a panic in a dependency.
+/// Letting a zero reach the emulator is not a graceful degradation: the grid
+/// must always keep at least one addressable cell, and a zero-sized grid
+/// turns the next PTY byte into an out-of-bounds panic on the reader thread,
+/// where nothing propagates it. The drain dies silently, every later snapshot
+/// is blank, and a careless test goes green. Zeroes arrive from ordinary
+/// arithmetic (`resize(cols - 1, …)` in a loop), so this must be a typed
+/// error, not a panic in a dependency.
 ///
 /// The floor is **2 per axis**, not 1, and each axis has its own reason —
 /// the guard against zero was one value too low on both (#211):
 ///
-/// - `cols == 1` and a double-width character: vt100 computes
-///   `size.cols - width` with `cols = 1` and `width = 2`. Rows are
-///   irrelevant; `1x8` printing `汉` is enough.
+/// - `cols == 1` and a double-width character: a 1-column grid cannot hold a
+///   2-column glyph. Rows are irrelevant; `1x8` printing `汉` is enough.
 /// - `rows == 1` and a line that *wraps* past the last column. Columns are
 ///   irrelevant: an entirely ordinary `80x1` printing a 100-character line
-///   panics, and so do `20x1` and `2x1`. A one-row terminal that scrolls by
+///   misbehaves, and so do `20x1` and `2x1`. A one-row terminal that scrolls by
 ///   newline rather than by wrapping is fine, which is what made this look
 ///   like an exotic case rather than an everyday one.
 ///
@@ -3707,7 +3705,7 @@ mod tests {
     use crate::{Error, Screen};
 
     /// An emulator that renders one line and then panics, so the reader's
-    /// failure path can be exercised without waiting for a vt100 bug to
+    /// failure path can be exercised without waiting for a grid edge case to
     /// come back (#211).
     struct PanickingEmulator {
         reads: usize,

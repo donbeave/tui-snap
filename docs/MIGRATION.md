@@ -16,21 +16,34 @@ separately. Outputs require review before replacing approved files. This is
 not a general migration of arbitrary schema-2 snapshots: unknown hidden/blink
 state cannot be recovered from that format.
 
-The vendored vt100 0.16.2 source fixes independent bold/DIM flags, DECAWM,
-wide continuation attributes, and hidden/blink/strike support. Archive and
-original per-file hashes are in `vendor/UPSTREAM.json`; full licensed source
-is included so a clean checkout builds without a developer-machine patch.
-The unmodified termlens 0.9 library is also vendored, with its vt100 dependency
-wired to that same local engine. Both are direct path dependencies: Git/path
-consumers need no `[patch.crates-io]` workaround. Original source hashes and
-licenses are retained in `vendor/TERMLENS-UPSTREAM.json` and `vendor/termlens`.
+# Engine swap: vt100 → termpane (schema 3 unchanged)
+
+Schema v3 is unchanged: blink stays frozen-visible with slow/rapid combined,
+hidden is conceal, overline/underline-styles stay dropped. MSRV is now 1.97
+(termpane floor) — a breaking change for consumers.
+
+The PTY engine and raw-ANSI replay now run on `termpane` v0.7.0 (pinned git
+tag via termlens) instead of the vendored vt100 0.16.2 fork. Attr mapping:
+hidden=conceal, blink=slow||rapid, all others 1:1; colors Default/Idx/Rgb 1:1;
+DECAWM, bell events, `?12`, serialization round-trips, DEC 2026 and DECRQM
+coverage per termpane CHANGELOG 0.7.0. The pending-wrap phantom column
+(`cursor_position` == cols) is clamped to `cols-1` in `ansi::replay_raw`,
+matching the prior fork behavior; `validate()` still rejects out-of-grid
+cursors loudly. The `termlens` shadow parser is deleted (attributes are native
+now). `pub use termlens` re-export and consumer type-identity stay intact.
+
+Historical note: the vendored vt100 0.16.2 fork (independent bold/DIM,
+DECAWM, wide continuation attributes, hidden/blink/strike) is removed. Its
+archive hashes were in `vendor/UPSTREAM.json` (deleted). termlens 0.9 remains
+vendored; its engine dependency is now the termpane git tag. Upstream source
+hashes and licenses are retained in `vendor/TERMLENS-UPSTREAM.json` and
+`vendor/termlens`.
 Code using `frame_from_screen` should construct its screen through the
 `tuisnap::termlens` re-export so the engine's Rust type identity matches.
 Qualify ordinary consumption with `cargo run --locked --manifest-path
-tests/fixtures/consumer/Cargo.toml` and inspect `cargo tree -i vt100` in that
-consumer. A future crates.io release must publish the forked engine packages
-under distinct names before replacing these Git/path dependencies; this PR
-does not silently fall back to the defective registry engine.
+tests/fixtures/consumer/Cargo.toml` and inspect `cargo tree -i termpane` (one
+version) and `cargo tree -i vt100` (empty) in that
+consumer.
 
 `Session::paste` retains termlens's simulated terminal behavior (LF→CR plus
 paste-marker sanitization). `Session::paste_literal` preserves literal line
@@ -59,7 +72,7 @@ intentional; the old APIs are gone, not deprecated.
 | `digest` CLI subcommand | `check` / `report` subcommands |
 | `render --input *.ansi` | `render` reads canonical `frame.json` only; raw streams replay via `ansi::replay_raw` (feature `pty`) |
 | `tuisnap::render::write_format`, `to_png_bytes`, block-glyph PNG | `render_png` (real fontdue glyphs), `render_svg`, `ansi_dump`; formats via CLI `--format` |
-| Hand-rolled SGR replay parser | Deleted; `vt100` is the established emulator |
+| Hand-rolled SGR replay parser | Deleted; `termpane` is the established emulator |
 | `PtySession` / `run_once(argv, opts, sends)` | `pty::Session` (termlens engine) / `run_once(argv, opts, sends, settle)`; waits now fail on timeout instead of returning `false` |
 
 ## Schema
@@ -85,7 +98,7 @@ cargo test                     # green
 ## Dependencies
 
 - Added (all latest, pure-cargo): `fontdue`, `image-compare`, `base64`,
-  `sha2`, `termlens` (optional via `pty` feature), `vt100` (optional).
+  `sha2`, `termlens` (optional via `pty` feature), `termpane` (optional).
 - Removed direct use of `portable-pty` (termlens owns PTY lifetime now).
 - Pure view tests: `cargo build/test --no-default-features` excludes
-  `termlens` + `vt100` entirely.
+  `termlens` + `termpane` entirely.

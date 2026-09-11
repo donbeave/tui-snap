@@ -2,24 +2,25 @@
 //!
 //! Contract (see RESEARCH.md §6):
 //! - **raw streams** (recorded PTY bytes, tmux `capture-pane -e` output)
-//!   replay through `vt100` with explicit dimensions — cursor motion,
+//!   replay through `termpane` with explicit dimensions — cursor motion,
 //!   alternate screen, and scrolling are interpreted, not discarded;
 //! - **normalized dumps** ([`crate::render::ansi_dump`]) are debugging views
 //!   generated FROM a frame and must never be re-parsed as state.
 //!
 //! The old hand-written SGR replay parser is gone on purpose.
 //!
-//! Raw replay preserves all cell attributes through the pinned vt100 patch.
+//! Raw replay preserves all cell attributes through termpane's native model
+//! (independent bold/dim, blink slow||rapid, conceal, strikethrough).
 //! Cursor appearance remains unsupported here: use the PTY path when shape
 //! or blinking is part of the assertion. Position and visibility are retained.
 
 use crate::frame::{Cell, Color, Cursor, CursorStyle, Frame, Mods, Provenance, Rgb};
 
-fn convert_color(c: vt100::Color) -> Color {
+fn convert_color(c: termpane::Color) -> Color {
     match c {
-        vt100::Color::Default => Color::Default,
-        vt100::Color::Idx(i) => Color::Indexed(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(Rgb::new(r, g, b)),
+        termpane::Color::Default => Color::Default,
+        termpane::Color::Idx(i) => Color::Indexed(i),
+        termpane::Color::Rgb(r, g, b) => Color::Rgb(Rgb::new(r, g, b)),
     }
 }
 
@@ -35,28 +36,27 @@ pub fn replay_raw(
     provenance: Provenance,
 ) -> anyhow::Result<Frame> {
     anyhow::ensure!(cols > 0 && rows > 0, "dimensions must be nonzero");
-    let mut parser = vt100::Parser::new(rows, cols, scrollback);
-    parser.process(bytes);
-    let screen = parser.screen();
+    let mut grid = termpane::DamageGrid::new(rows, cols, scrollback);
+    grid.process(bytes);
     let mut frame = Frame::blank(cols, rows, provenance);
     for r in 0..rows {
         for c in 0..cols {
-            let Some(vt) = screen.cell(r, c) else {
+            let Some(tp) = grid.cell(r, c) else {
                 continue;
             };
-            if vt.is_wide_continuation() {
+            if tp.is_wide_continuation {
                 let mut cont = Cell::blank(c, r);
-                cont.fg = convert_color(vt.fgcolor());
-                cont.bg = convert_color(vt.bgcolor());
+                cont.fg = convert_color(tp.fgcolor());
+                cont.bg = convert_color(tp.bgcolor());
                 cont.mods = Mods {
-                    bold: vt.bold(),
-                    dim: vt.dim(),
-                    italic: vt.italic(),
-                    underline: vt.underline(),
-                    reverse: vt.inverse(),
-                    strikethrough: vt.strikethrough(),
-                    hidden: vt.hidden(),
-                    blink: vt.blink(),
+                    bold: tp.bold(),
+                    dim: tp.dim(),
+                    italic: tp.italic(),
+                    underline: tp.underline(),
+                    reverse: tp.inverse(),
+                    strikethrough: tp.strikethrough(),
+                    hidden: tp.conceal(),
+                    blink: tp.slow_blink() || tp.rapid_blink(),
                 };
                 cont.width = 0;
                 cont.continuation = true;
@@ -64,39 +64,42 @@ pub fn replay_raw(
                 frame.set(cont);
                 continue;
             }
-            let symbol = if vt.contents().is_empty() {
+            let symbol = if tp.contents().is_empty() {
                 " ".to_string()
             } else {
-                vt.contents().to_string()
+                tp.contents().to_string()
             };
             frame.set(Cell {
                 x: c,
                 y: r,
                 symbol,
-                width: if vt.is_wide() { 2 } else { 1 },
+                width: if tp.is_wide { 2 } else { 1 },
                 continuation: false,
-                fg: convert_color(vt.fgcolor()),
-                bg: convert_color(vt.bgcolor()),
+                fg: convert_color(tp.fgcolor()),
+                bg: convert_color(tp.bgcolor()),
                 mods: Mods {
-                    bold: vt.bold(),
-                    dim: vt.dim(),
-                    italic: vt.italic(),
-                    underline: vt.underline(),
-                    strikethrough: vt.strikethrough(),
-                    hidden: vt.hidden(),
-                    blink: vt.blink(),
-                    reverse: vt.inverse(),
+                    bold: tp.bold(),
+                    dim: tp.dim(),
+                    italic: tp.italic(),
+                    underline: tp.underline(),
+                    strikethrough: tp.strikethrough(),
+                    hidden: tp.conceal(),
+                    blink: tp.slow_blink() || tp.rapid_blink(),
+                    reverse: tp.inverse(),
                 },
             });
         }
     }
-    // vt100 reports (row, col). No clamping: `validate` below rejects
-    // out-of-grid cursors explicitly.
-    let (row, col) = screen.cursor_position();
+    // termpane reports the phantom pending-wrap column (== cols) while a
+    // deferred wrap is armed; the canonical frame holds a physical cursor,
+    // so clamp to cols-1 without discarding the pending wrap in the grid.
+    // `validate` below still rejects out-of-grid cursors loudly.
+    let (row, col) = grid.cursor_position();
+    let col = col.min(cols.saturating_sub(1));
     frame.cursor = Cursor {
         x: col,
         y: row,
-        visible: !screen.hide_cursor(),
+        visible: !grid.hide_cursor(),
         style: CursorStyle::Block,
         blinking: false,
     };

@@ -70,9 +70,14 @@ tuisnap run --cols 120 --rows 40 --send enter --wait-for Ready \
 `render` also accepts `--font-file` (hash recorded); all gates accept it too.
 Offline `frame.json` re-renders byte-identical PNGs (proven by tests).
 
-Git/path library dependencies include the pinned PTY engine and need no Cargo
-patches. Use `tuisnap::termlens` when constructing engine types for
-`frame_from_screen`. See `docs/MIGRATION.md` for schema 3 and fixture migration.
+Git/path library dependencies include the pinned PTY engine (termpane v0.7.0
+via termlens) and need no Cargo patches. Use `tuisnap::termlens` when
+constructing engine types for `frame_from_screen`. See `docs/MIGRATION.md`
+for schema 3, the vt100 → termpane engine swap, and fixture migration.
+
+MSRV: 1.97 (termpane floor). Schema v3 unchanged: blink is frozen-visible
+with slow/rapid combined, hidden is conceal, overline/underline-styles stay
+dropped.
 
 Consumer and migration gates:
 

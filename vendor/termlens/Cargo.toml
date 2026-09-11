@@ -66,9 +66,9 @@ version = "2"
 [dependencies.unicode-normalization]
 version = "0.1"
 
-[dependencies.vt100]
-version = "0.16"
-path = "../vt100"
+[dependencies.termpane]
+git = "https://github.com/tailrocks/termpane"
+tag = "v0.7.0"
 
 [dev-dependencies.anyhow]
 version = "1"

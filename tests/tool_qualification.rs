@@ -21,31 +21,25 @@ fn hidden_svg_cells_keep_whitespace_geometry() {
 #[test]
 fn serialized_contents_restore_wrap_before_painting() {
     for target_disabled in [false, true] {
-        let mut before = vt100::Parser::new(3, 8, 0);
+        let mut before = termpane::DamageGrid::new(3, 8, 0);
         before.process(b"\x1b[?7l");
-        let mut after = vt100::Parser::new(3, 8, 0);
+        let mut after = termpane::DamageGrid::new(3, 8, 0);
         after.process(b"ABCDEFGHIJ");
         if target_disabled {
             after.process(b"\x1b[?7l");
         }
         for delta in [false, true] {
             let encoded = if delta {
-                after.screen().state_diff(before.screen())
+                after.state_diff(&before)
             } else {
-                after.screen().state_formatted()
+                after.state_formatted()
             };
-            let mut replay = vt100::Parser::new(3, 8, 0);
-            replay.process(&before.screen().state_formatted());
+            let mut replay = termpane::DamageGrid::new(3, 8, 0);
+            replay.process(&before.state_formatted());
             replay.process(&encoded);
-            assert_eq!(replay.screen().contents(), after.screen().contents());
-            assert_eq!(
-                replay.screen().cursor_position(),
-                after.screen().cursor_position()
-            );
-            assert_eq!(
-                replay.screen().input_mode_formatted(),
-                after.screen().input_mode_formatted()
-            );
+            assert!(replay.state_eq(&after));
+            assert_eq!(replay.cursor_position(), after.cursor_position());
+            assert_eq!(replay.input_mode_formatted(), after.input_mode_formatted());
         }
     }
 }
@@ -132,10 +126,10 @@ fn autowrap_off_overwrites_last_cell_then_can_be_reenabled() {
 #[cfg(feature = "pty")]
 #[test]
 fn formatted_intensity_roundtrip_clears_each_independent_flag() {
-    let mut parser = vt100::Parser::new(2, 8, 0);
-    parser.process(b"\x1b[1;2mX\x1b[22;1mB\x1b[22;2mD\x1b[0mN");
-    let encoded = parser.screen().contents_formatted();
-    let mut replay = vt100::Parser::new(2, 8, 0);
+    let mut grid = termpane::DamageGrid::new(2, 8, 0);
+    grid.process(b"\x1b[1;2mX\x1b[22;1mB\x1b[22;2mD\x1b[0mN");
+    let encoded = grid.contents_formatted();
+    let mut replay = termpane::DamageGrid::new(2, 8, 0);
     replay.process(&encoded);
     for (x, bold, dim) in [
         (0, true, true),
@@ -143,7 +137,7 @@ fn formatted_intensity_roundtrip_clears_each_independent_flag() {
         (2, false, true),
         (3, false, false),
     ] {
-        let c = replay.screen().cell(0, x).unwrap();
+        let c = replay.cell(0, x).unwrap();
         assert_eq!((c.bold(), c.dim()), (bold, dim));
     }
 }
@@ -198,16 +192,17 @@ fn autowrap_off_does_not_shift_wide_glyph_left_at_margin() {
 #[cfg(feature = "pty")]
 #[test]
 fn formatted_terminal_modes_preserve_autowrap_disable_and_restore() {
-    let mut parser = vt100::Parser::new(2, 8, 0);
-    let original = parser.screen().clone();
-    parser.process(b"\x1b[?7l");
-    let mut replay = vt100::Parser::new(2, 8, 0);
-    replay.process(&parser.screen().input_mode_formatted());
+    let mut grid = termpane::DamageGrid::new(2, 8, 0);
+    let mut original = termpane::DamageGrid::new(2, 8, 0);
+    original.process(&grid.state_formatted());
+    grid.process(b"\x1b[?7l");
+    let mut replay = termpane::DamageGrid::new(2, 8, 0);
+    replay.process(&grid.input_mode_formatted());
     replay.process(b"\x1b[1;8HABC");
-    assert_eq!(replay.screen().cell(0, 7).unwrap().contents(), "C");
-    replay.process(&original.input_mode_diff(parser.screen()));
+    assert_eq!(replay.cell(0, 7).unwrap().contents(), "C");
+    replay.process(&original.input_mode_diff(&grid));
     replay.process(b"D");
-    assert_eq!(replay.screen().cell(1, 0).unwrap().contents(), "D");
+    assert_eq!(replay.cell(1, 0).unwrap().contents(), "D");
 }
 
 #[cfg(feature = "pty")]
