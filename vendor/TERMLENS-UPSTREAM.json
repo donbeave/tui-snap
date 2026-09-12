@@ -6,7 +6,7 @@
   "upstream_commit": "8ca2494e7d5a9d5f3ed702bafe82dda00be706a3",
   "license_source": "https://github.com/vyncint/termlens/tree/8ca2494e7d5a9d5f3ed702bafe82dda00be706a3",
   "modifications": [
-    "Cargo.toml: termpane git dependency (tag v0.7.0), removed vt100 dependency",
+    "Cargo.toml: termpane git dependency (tag v0.1.0), removed vt100 dependency",
     "Cargo.toml: removed explicit example/test targets absent from library-only vendor copy",
     "src/emu: TermpaneEmulator backend over termpane 0.7 (native attrs, scrollback, modes); removed vt100 backend + shadow parser",
     "src/screen.rs: bold/dim documented as independent flags (termpane parity)",
