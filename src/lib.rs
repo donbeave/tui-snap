@@ -35,3 +35,4 @@ pub use profile::{
     FontFaces, Profile, VENDORED_FACES, VENDORED_FONT, VENDORED_FONT_BOLD,
     VENDORED_FONT_BOLD_ITALIC, VENDORED_FONT_ITALIC,
 };
+pub use render::Renderer;

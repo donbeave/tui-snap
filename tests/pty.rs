@@ -64,6 +64,111 @@ fn exit_resize_and_cleanup() {
 }
 
 #[test]
+fn wait_until_accepts_custom_predicates() {
+    let mut s = Session::spawn(
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf ready; sleep 30".into(),
+        ],
+        &PtyOptions {
+            timeout: Duration::from_secs(5),
+            ..opts()
+        },
+    )
+    .unwrap();
+    // Beyond wait_for_text: text present AND cursor parked after it.
+    s.wait_until(|sc| sc.text().contains("ready") && sc.cursor() == (0, 5, true))
+        .unwrap();
+    // A predicate that never holds times out with screen evidence.
+    let mut s2 = Session::spawn(
+        &["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        &PtyOptions {
+            timeout: Duration::from_millis(400),
+            ..opts()
+        },
+    )
+    .unwrap();
+    let err = s2
+        .wait_until(|sc| sc.text().contains("never-appears"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("timed out"), "{err}");
+}
+
+#[test]
+fn env_set_and_remove_reach_the_child() {
+    std::env::set_var("TUISNAP_PTY_STRIP_ME", "1");
+    let run = |opts: &PtyOptions| -> String {
+        let mut s = Session::spawn(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo strip=$TUISNAP_PTY_STRIP_ME set=$TUISNAP_PTY_SET_ME; sleep 30".into(),
+            ],
+            opts,
+        )
+        .unwrap();
+        s.wait_stable(Duration::from_millis(400)).unwrap().text()
+    };
+    // Default: the inherited ambient variable reaches the child.
+    let base = run(&opts());
+    assert!(base.contains("strip=1"), "{base}");
+    // env_remove strips the inherited var; with_env sets a new one.
+    let cleaned = run(
+        &opts()
+            .without_env("TUISNAP_PTY_STRIP_ME")
+            .with_env("TUISNAP_PTY_SET_ME", "yes"),
+    );
+    assert!(
+        !cleaned.contains("strip=1"),
+        "stripped var must be gone: {cleaned}"
+    );
+    assert!(cleaned.contains("set=yes"), "{cleaned}");
+    std::env::remove_var("TUISNAP_PTY_STRIP_ME");
+}
+
+#[test]
+fn modified_special_keys_send_csi_modifier_forms() {
+    // `cat -v` renders the wire bytes readably (^[[1;5A etc.).
+    let mut s = Session::spawn(&["/bin/cat".into(), "-v".into()], &opts()).unwrap();
+    s.send_key("ctrl-up").unwrap();
+    s.send_key("shift-f5").unwrap();
+    s.send_key("ctrl-alt-delete").unwrap();
+    s.send_key("enter").unwrap();
+    s.wait_until(|sc| {
+        let t = sc.text();
+        t.contains("1;5A") && t.contains("15;2~") && t.contains("3;7~")
+    })
+    .unwrap();
+    // Ordinary names and single-char chords still parse.
+    assert!(s.send_key("ctrl-f13").is_err());
+    assert!(s.send_key("shift-up-down").is_err());
+}
+
+#[test]
+fn mouse_wrappers_reach_the_engine() {
+    // `cat` never enables mouse tracking: the engine's explicit error
+    // proves the wrapper delivered the gesture request.
+    let mut s = Session::spawn(&["/bin/cat".into()], &opts()).unwrap();
+    let err = s
+        .scroll(1, 1, tuisnap::pty::Scroll::Up)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("mouse tracking"), "{err}");
+    let err = s
+        .click_with(tuisnap::pty::MouseButton::Right, 1, 1)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("mouse tracking"), "{err}");
+    let err = s
+        .scroll_with(tuisnap::pty::Scroll::Down.ctrl(), 1, 1)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("mouse tracking"), "{err}");
+}
+
+#[test]
 fn keys_drive_fixture_app_screen() {
     let bin = fixture_bin();
     assert!(

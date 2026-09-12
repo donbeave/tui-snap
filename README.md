@@ -16,7 +16,7 @@ validates the fixtures covered — never every app state.
 ## Quick start: pure view tests
 
 ```rust
-use tuisnap::{Profile, Provenance, VENDORED_FONT};
+use tuisnap::{Profile, Provenance, VENDORED_FACES};
 use tuisnap::snapshot::Store;
 
 #[test]
@@ -29,9 +29,18 @@ fn home_screen() {
     });
     // Actual artifacts are written BEFORE the assertion, so a failure still
     // leaves reviewable evidence (actual/*.frame.json + *.png + report.html).
-    let outcome = store.check("home", &frame, &profile, VENDORED_FONT, 1.0).unwrap();
+    let outcome = store.check("home", &frame, &profile, &VENDORED_FACES, 1.0).unwrap();
     outcome.ensure_matched().unwrap();
 }
+```
+
+Bulk suites reuse one cached renderer per thread and can rebuild the HTML
+report without the CLI:
+
+```rust
+let mut renderer = profile.renderer(&VENDORED_FACES)?;      // fonts parsed once
+let outcome = store.check_with(&mut renderer, "home", &frame, 1.0)?;
+let report = store.report_with(&mut renderer, 1.0, "my suite")?; // re-verify + report.html
 ```
 
 First run fails with `missing-approval` (fail-closed). Inspect
@@ -48,9 +57,14 @@ snapshots by itself (see `docs/CI.md`).
 ## Interactive tests (feature `pty`, on by default)
 
 ```rust
+let opts = tuisnap::pty::PtyOptions::default()
+    .without_env("NO_COLOR")                    // strip inherited vars from the child
+    .with_env("HOLLA_NO_HISTORY", "1");         // set app-specific ones
 let mut s = tuisnap::pty::Session::spawn(&["./my-tui".into()], &opts)?;
 s.wait_for_text("Ready")?;                 // timeout fails WITH the screen
-s.send_key("enter")?;
+s.wait_until(|sc| sc.cursor() == (0, 4, true))?;  // any predicate on the live screen
+s.send_key("ctrl-up")?;                    // ctrl/alt/shift + special keys, too
+s.scroll(10, 5, tuisnap::pty::Scroll::Down)?;     // wheel + non-left clicks: click_with
 let frame = s.wait_stable(Duration::from_millis(300))?;  // style-aware settle
 ```
 

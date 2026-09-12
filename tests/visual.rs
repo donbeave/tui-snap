@@ -32,6 +32,8 @@ fn prov() -> Provenance {
 fn fixture_visual_gates() {
     let st = store();
     let profile = Profile::default_profile();
+    // One renderer for the whole matrix: faces parsed once, glyphs cached.
+    let mut renderer = profile.renderer(&VENDORED_FACES).unwrap();
     let screens = [Screen::Home, Screen::Table, Screen::Dialog, Screen::Glyphs];
     let themes = [(true, "dark"), (false, "light")];
     let sizes = [(80u16, 24u16), (120, 40), (160, 50)];
@@ -43,9 +45,7 @@ fn fixture_visual_gates() {
                 let model = Model::new(screen, dark);
                 let frame =
                     tuisnap::ratatui::draw_frame(cols, rows, prov(), |f| render_model(f, &model));
-                let outcome = st
-                    .check(&name, &frame, &profile, &VENDORED_FACES, 1.0)
-                    .unwrap();
+                let outcome = st.check_with(&mut renderer, &name, &frame, 1.0).unwrap();
                 outcomes.push((name, outcome));
             }
         }
@@ -53,35 +53,9 @@ fn fixture_visual_gates() {
     // Report always written (reviewable even on failure).
     let entries: Vec<_> = outcomes
         .iter()
-        .map(|(_, o)| {
-            use base64::Engine;
-            let b64 = &base64::engine::general_purpose::STANDARD;
-            tuisnap::snapshot::ReportEntry {
-                outcome: o.clone(),
-                expected_png_b64: o
-                    .expected_png
-                    .as_ref()
-                    .and_then(|p| std::fs::read(p).ok())
-                    .map(|b| b64.encode(&b)),
-                actual_png_b64: b64.encode(std::fs::read(&o.actual_png).unwrap()),
-                diff_png_b64: o
-                    .diff_png
-                    .as_ref()
-                    .and_then(|p| std::fs::read(p).ok())
-                    .map(|b| b64.encode(&b)),
-                expected_frame_json: std::fs::read_to_string(&o.expected_frame).ok(),
-                actual_frame_json: {
-                    let c = std::fs::read_to_string(&o.actual_frame).unwrap();
-                    tuisnap::Frame::from_json(&c).unwrap().to_json_pretty()
-                },
-                actual_frame_compact: std::fs::read_to_string(&o.actual_frame).unwrap(),
-                profile_desc: profile.name.clone(),
-                font_sha256: profile.font_sha256.clone(),
-            }
-        })
+        .map(|(_, o)| st.report_entry(o, &profile).unwrap())
         .collect();
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/visual");
-    tuisnap::snapshot::write_report(&Store::new(&root), "fixture visual gates", &entries).unwrap();
+    tuisnap::snapshot::write_report(&st, "fixture visual gates", &entries).unwrap();
     let mut failures = Vec::new();
     for (name, o) in &outcomes {
         if let Err(e) = o.ensure_matched() {

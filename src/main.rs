@@ -162,6 +162,22 @@ fn esc_html(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Render `frame` through a lazily constructed [`tuisnap::render::Renderer`]
+/// shared across formats, so `--format png --format html` parses the faces
+/// once.
+fn render_cached(
+    slot: &mut Option<tuisnap::Renderer>,
+    frame: &tuisnap::Frame,
+    profile: &tuisnap::Profile,
+    faces: &tuisnap::FontFaces<'_>,
+) -> Result<tuisnap::render::Rendered> {
+    if slot.is_none() {
+        *slot = Some(tuisnap::Renderer::new(profile, faces).map_err(|e| anyhow::anyhow!("{e}"))?);
+    }
+    let r = slot.as_mut().expect("constructed above");
+    r.render(frame).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 fn render_formats(
     frame: &tuisnap::Frame,
     profile: &tuisnap::Profile,
@@ -173,6 +189,7 @@ fn render_formats(
     if formats.is_empty() {
         anyhow::bail!("no --format given");
     }
+    let mut renderer: Option<tuisnap::Renderer> = None;
     for f in formats {
         let path = format!("{out}.{f}");
         if let Some(parent) = std::path::Path::new(&path).parent() {
@@ -189,8 +206,7 @@ fn render_formats(
                 // Standalone view: selectable SVG as the primary visual, the
                 // authoritative PNG kept under <details>, frame JSON embedded
                 // for lossless re-import.
-                let rendered = tuisnap::render::render_png_report(frame, profile, faces)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let rendered = render_cached(&mut renderer, frame, profile, faces)?;
                 let b64 =
                     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &rendered.png);
                 let (png_w, _) = profile.image_size(frame.cols, frame.rows);
@@ -207,8 +223,7 @@ fn render_formats(
                 std::fs::write(&path, html)?;
             }
             "png" => {
-                let rendered = tuisnap::render::render_png_report(frame, profile, faces)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let rendered = render_cached(&mut renderer, frame, profile, faces)?;
                 std::fs::write(&path, &rendered.png)?;
                 let sidecar = format!("{path}.fidelity.json");
                 std::fs::write(&sidecar, rendered.fidelity.to_json())?;
@@ -224,43 +239,6 @@ fn render_formats(
         eprintln!("wrote {path}");
     }
     Ok(())
-}
-
-fn report_entry(
-    store: &tuisnap::snapshot::Store,
-    outcome: &tuisnap::snapshot::CompareOutcome,
-    profile: &tuisnap::Profile,
-) -> Result<tuisnap::snapshot::ReportEntry> {
-    use base64::Engine;
-    let b64 = &base64::engine::general_purpose::STANDARD;
-    let actual_png = std::fs::read(&outcome.actual_png)?;
-    let actual_compact = std::fs::read_to_string(&outcome.actual_frame)?;
-    let actual_frame =
-        tuisnap::Frame::from_json(&actual_compact).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let actual_json = actual_frame.to_json_pretty();
-    let expected_png_b64 = outcome
-        .expected_png
-        .as_ref()
-        .and_then(|p| std::fs::read(p).ok())
-        .map(|b| b64.encode(&b));
-    let diff_png_b64 = outcome
-        .diff_png
-        .as_ref()
-        .and_then(|p| std::fs::read(p).ok())
-        .map(|b| b64.encode(&b));
-    let expected_frame_json = std::fs::read_to_string(&outcome.expected_frame).ok();
-    let _ = store;
-    Ok(tuisnap::snapshot::ReportEntry {
-        outcome: outcome.clone(),
-        expected_png_b64,
-        actual_png_b64: b64.encode(&actual_png),
-        diff_png_b64,
-        expected_frame_json,
-        actual_frame_json: actual_json,
-        actual_frame_compact: actual_compact,
-        profile_desc: profile.name.clone(),
-        font_sha256: profile.font_sha256.clone(),
-    })
 }
 
 fn main() -> Result<()> {
@@ -298,7 +276,7 @@ fn main() -> Result<()> {
             let frame = tuisnap::Frame::from_json(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
             let st = tuisnap::snapshot::Store::new(&store);
             let outcome = st.check(&name, &frame, &profile, &owned.faces(), pixel_threshold)?;
-            let entry = report_entry(&st, &outcome, &profile)?;
+            let entry = st.report_entry(&outcome, &profile)?;
             let report = tuisnap::snapshot::write_report(&st, "tuisnap visual report", &[entry])?;
             eprintln!("report: {}", report.display());
             outcome
@@ -328,26 +306,9 @@ fn main() -> Result<()> {
         } => {
             let (owned, profile) = load_font_bytes(font_file.as_ref())?;
             let st = tuisnap::snapshot::Store::new(&store);
-            let mut entries = Vec::new();
-            let mut failed = 0u32;
-            for path in glob_actual(&store)? {
-                let text = std::fs::read_to_string(&path)?;
-                let frame = tuisnap::Frame::from_json(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.strip_suffix(".frame"))
-                    .unwrap_or("?")
-                    .to_string();
-                let outcome =
-                    st.check(&name, &frame, &profile, &owned.faces(), pixel_threshold)?;
-                if !outcome.status.matched() {
-                    failed += 1;
-                }
-                entries.push(report_entry(&st, &outcome, &profile)?);
-            }
-            let report = tuisnap::snapshot::write_report(&st, &title, &entries)?;
-            println!("report: {} ({} failed)", report.display(), failed);
+            let report = st.report(&profile, &owned.faces(), pixel_threshold, &title)?;
+            let failed = report.failed() as u32;
+            println!("report: {} ({} failed)", report.path.display(), failed);
             if failed > 0 {
                 anyhow::bail!("{failed} snapshot(s) require review");
             }
@@ -386,7 +347,7 @@ fn main() -> Result<()> {
                     let (owned, profile) = load_font_bytes(font_file.as_ref())?;
                     let st = tuisnap::snapshot::Store::new(&root);
                     let outcome = st.check(&n, &frame, &profile, &owned.faces(), pixel_threshold)?;
-                    let entry = report_entry(&st, &outcome, &profile)?;
+                    let entry = st.report_entry(&outcome, &profile)?;
                     let report =
                         tuisnap::snapshot::write_report(&st, "tuisnap visual report", &[entry])?;
                     eprintln!("report: {}", report.display());
@@ -410,25 +371,4 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn glob_actual(store: &std::path::Path) -> Result<Vec<PathBuf>> {
-    let dir = store.join("actual");
-    let mut out = Vec::new();
-    if !dir.exists() {
-        return Ok(out);
-    }
-    // Same contract as `Store::actual_names`: canonical `*.frame.json` only.
-    for entry in std::fs::read_dir(&dir)? {
-        let p = entry?.path();
-        if p.extension().and_then(|s| s.to_str()) == Some("json")
-            && p.file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.ends_with(".frame"))
-        {
-            out.push(p);
-        }
-    }
-    out.sort();
-    Ok(out)
 }

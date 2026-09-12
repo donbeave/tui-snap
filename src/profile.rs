@@ -123,6 +123,17 @@ impl Profile {
         self
     }
 
+    /// A reusable [`crate::render::Renderer`] pinned to this profile: faces
+    /// parsed once, glyph rasters cached across frames. Bulk gates
+    /// (`Store::check_with`/`Store::report_with`) should go through one of
+    /// these per thread instead of the one-shot free functions.
+    pub fn renderer(
+        &self,
+        faces: &FontFaces<'_>,
+    ) -> Result<crate::render::Renderer, crate::render::RenderError> {
+        crate::render::Renderer::new(self, faces)
+    }
+
     /// Image dimensions for a `cols`×`rows` frame.
     #[must_use]
     pub fn image_size(&self, cols: u16, rows: u16) -> (u32, u32) {

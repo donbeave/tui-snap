@@ -15,7 +15,8 @@
 //! - bold / italic / bold-italic use the REAL faces of the pinned family
 //!   (faux double-strike / shear survive only as fallback when a face fails
 //!   to load or the family is a single-face override);
-//! - underline / strikethrough drawn at fixed offsets from the baseline;
+//! - underline / strikethrough drawn at fixed offsets from the baseline,
+//!   including across whitespace cells (as real terminals do);
 //! - blink frozen as visible; concealed glyphs omitted (see [`crate::frame`]);
 //! - glyphs no face in the chain covers draw a deterministic tofu box AND are
 //!   reported in the [`Fidelity`] record (the `.png.fidelity.json` sidecar) —
@@ -165,6 +166,236 @@ pub struct Rendered {
     pub fidelity: Fidelity,
 }
 
+/// Glyph rasters keyed by character and face, negative results included
+/// (`None` = rasterized once to an empty bitmap — never re-rasterized).
+type GlyphCache = std::collections::HashMap<GlyphKey, Option<(fontdue::Metrics, Vec<u8>)>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GlyphKey {
+    ch: char,
+    face: FaceIdx,
+}
+
+/// The face a glyph was actually rasterized from. Rasterize size is fixed
+/// per [`Renderer`] (`font_px * scale`), so it is not part of the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FaceIdx {
+    Regular,
+    Bold,
+    Italic,
+    BoldItalic,
+}
+
+fn face_idx(bold: bool, italic: bool) -> FaceIdx {
+    match (bold, italic) {
+        (true, true) => FaceIdx::BoldItalic,
+        (true, false) => FaceIdx::Bold,
+        (false, true) => FaceIdx::Italic,
+        (false, false) => FaceIdx::Regular,
+    }
+}
+
+/// A reusable renderer: parses the pinned faces ONCE at construction (the
+/// geometry pin is verified there too) and caches glyph rasters across
+/// frames, so a bulk gate costs O(distinct glyphs) rasterizations instead of
+/// 5 font parses plus a full re-rasterization per frame.
+///
+/// Threading: every method takes `&mut self`, so the borrow checker enforces
+/// exclusive use — give each parallel test thread its own instance
+/// (`thread_local!` is the convenient carrier), matching the per-thread
+/// session confinement of the PTY layer.
+pub struct Renderer {
+    profile: Profile,
+    set: FontSet,
+    glyphs: GlyphCache,
+}
+
+impl Renderer {
+    /// Load the faces and verify the geometry pin (once for all renders).
+    pub fn new(profile: &Profile, faces: &FontFaces<'_>) -> Result<Self, RenderError> {
+        // Geometry pins are UNSCALED metrics; the gate compares against the
+        // profile constants directly.
+        let unscaled = load_font(faces.regular, profile.font_px)?;
+        verify_geometry(&unscaled, profile)?;
+        // HiDPI: rasterize glyphs at the final scale, no post upscale.
+        let set = FontSet::load(faces, profile.font_px * profile.scale as f32)?;
+        Ok(Self {
+            profile: profile.clone(),
+            set,
+            glyphs: GlyphCache::new(),
+        })
+    }
+
+    /// The profile this renderer is pinned to.
+    #[must_use]
+    pub fn profile(&self) -> &Profile {
+        &self.profile
+    }
+
+    /// Distinct `(char, face)` rasters currently cached (diagnostics).
+    #[must_use]
+    pub fn cached_glyphs(&self) -> usize {
+        self.glyphs.len()
+    }
+
+    /// Render a validated frame to PNG bytes.
+    pub fn render_png(&mut self, frame: &Frame) -> Result<Vec<u8>, RenderError> {
+        Ok(self.render(frame)?.png)
+    }
+
+    /// Render plus exact coverage accounting (see [`Fidelity`]).
+    pub fn render(&mut self, frame: &Frame) -> Result<Rendered, RenderError> {
+        frame
+            .validate()
+            .map_err(|e| RenderError(format!("refusing to render: {e}")))?;
+        let profile = &self.profile;
+        let u = profile.scale;
+        let cell_w = profile.cell_w * u;
+        let cell_h = profile.cell_h * u;
+        let pad = profile.pad * u;
+        let u_i = u as i32;
+
+        let w = frame.cols as u32 * cell_w + pad * 2;
+        let h = frame.rows as u32 * cell_h + pad * 2;
+        let bg = profile.default_bg;
+        let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([bg.r, bg.g, bg.b]));
+        let mut missing: Vec<MissingGlyph> = Vec::new();
+
+        for y in 0..frame.rows {
+            for x in 0..frame.cols {
+                let Some(cell) = frame.get(x, y) else {
+                    continue;
+                };
+                if cell.continuation {
+                    continue;
+                }
+                let (fg, cbg) = Frame::resolve_cell(cell, profile.default_fg, profile.default_bg);
+                let span = u32::from(cell.width.max(1)) * cell_w;
+                let cx = pad + x as u32 * cell_w;
+                let cy = pad + y as u32 * cell_h;
+                if cbg != profile.default_bg {
+                    fill_rect(&mut img, cx, cy, span, cell_h, cbg);
+                }
+                if cell.mods.hidden {
+                    continue;
+                }
+                let baseline = cy as i32 + self.set.regular.ascent.round() as i32;
+                // Whitespace cells carry no glyph, but real terminals still
+                // draw underline/strikethrough across them (the background is
+                // already painted above) — decorations are not part of the
+                // skipped glyph draw.
+                if !cell.symbol.trim().is_empty() {
+                    draw_symbol(
+                        &mut img,
+                        &self.set,
+                        &mut self.glyphs,
+                        &cell.symbol,
+                        cx as i32,
+                        baseline,
+                        span,
+                        cy as i32,
+                        cell_h,
+                        fg,
+                        cell.mods.bold,
+                        cell.mods.italic,
+                        u_i,
+                        Some((&mut missing, x, y)),
+                    );
+                }
+                if cell.mods.underline {
+                    let uy = (baseline + 2 * u_i).min((cy + cell_h - 1) as i32);
+                    let th = if cell.mods.bold { 2 * u } else { u };
+                    for t in 0..th {
+                        for dx in 0..span {
+                            blend(&mut img, cx + dx, (uy + t as i32) as u32, fg, 255);
+                        }
+                    }
+                }
+                if cell.mods.strikethrough {
+                    let sy = baseline - (self.set.regular.ascent * 0.35) as i32;
+                    for t in 0..u {
+                        for dx in 0..span {
+                            blend(&mut img, cx + dx, (sy + t as i32).max(0) as u32, fg, 255);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Block cursor: fill cell with fg, redraw glyph in bg (classic terminal).
+        if frame.cursor.visible && profile.cursor_visible {
+            let mut cx = frame.cursor.x;
+            if frame
+                .get(cx, frame.cursor.y)
+                .is_some_and(|c| c.continuation)
+            {
+                cx = cx.saturating_sub(1);
+            }
+            if let Some(cell) = frame.get(cx, frame.cursor.y) {
+                let (fg, cbg) = Frame::resolve_cell(cell, profile.default_fg, profile.default_bg);
+                let span = u32::from(cell.width.max(1)) * cell_w;
+                let px = pad + cx as u32 * cell_w;
+                let py = pad + frame.cursor.y as u32 * cell_h;
+                let style = frame.cursor.style;
+                match style {
+                    crate::frame::CursorStyle::Block => {
+                        fill_rect(&mut img, px, py, span, cell_h, fg);
+                        if !cell.mods.hidden && !cell.symbol.trim().is_empty() {
+                            let baseline = py as i32 + self.set.regular.ascent.round() as i32;
+                            draw_symbol(
+                                &mut img,
+                                &self.set,
+                                &mut self.glyphs,
+                                &cell.symbol,
+                                px as i32,
+                                baseline,
+                                span,
+                                py as i32,
+                                cell_h,
+                                cbg,
+                                false,
+                                false,
+                                u_i,
+                                None,
+                            );
+                        }
+                    }
+                    crate::frame::CursorStyle::Underline => {
+                        let uy = (py + cell_h - 2 * u) as i32;
+                        for t in 0..2 * u {
+                            for dx in 0..span {
+                                blend(&mut img, px + dx, (uy + t as i32) as u32, fg, 255);
+                            }
+                        }
+                    }
+                    crate::frame::CursorStyle::Bar => {
+                        for dx in 0..2 * u {
+                            for dy in 0..cell_h {
+                                blend(&mut img, px + dx, py + dy, fg, 255);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .map_err(|e| RenderError(format!("PNG encode: {e}")))?;
+        let fidelity = Fidelity {
+            profile: profile.name.clone(),
+            font_sha256: profile.font_sha256.clone(),
+            font_desc: profile.font_desc.clone(),
+            scale: u,
+            approximate: !missing.is_empty() || !self.set.fell_back.is_empty(),
+            faces_fell_back: self.set.fell_back.iter().map(|s| s.to_string()).collect(),
+            missing,
+        };
+        Ok(Rendered { png: out, fidelity })
+    }
+}
+
 fn blend(dst: &mut image::RgbImage, x: u32, y: u32, fg: Rgb, cov: u8) {
     if cov == 0 {
         return;
@@ -234,11 +465,13 @@ fn draw_tofu(dst: &mut image::RgbImage, x0: i32, top: i32, span_px: u32, h: u32,
 /// same origin (documented approximation of terminal combining behavior).
 /// Face chain: styled face → regular face → tofu (recorded in `missing`
 /// when `Some`). Faux styles apply only when the regular face serves a cell
-/// whose mods asked for a styled face.
+/// whose mods asked for a styled face. Rasters come from `cache` (per
+/// `(char, face)`, negatives included) instead of re-rasterizing per cell.
 #[allow(clippy::too_many_arguments)]
 fn draw_symbol(
     dst: &mut image::RgbImage,
     set: &FontSet,
+    cache: &mut GlyphCache,
     symbol: &str,
     pen_x: i32,
     baseline: i32,
@@ -252,20 +485,28 @@ fn draw_symbol(
     missing: Option<(&mut Vec<MissingGlyph>, u16, u16)>,
 ) {
     let styled = set.styled(bold, italic);
+    let styled_idx = face_idx(bold, italic);
     let mut uncovered: Vec<char> = Vec::new();
     for c in symbol.chars() {
-        let (face, faux_bold, faux_italic) = if styled.font.lookup_glyph_index(c) != 0 {
-            (styled, false, false)
+        let (face, idx, faux_bold, faux_italic) = if styled.font.lookup_glyph_index(c) != 0 {
+            (styled, styled_idx, false, false)
         } else if set.regular.font.lookup_glyph_index(c) != 0 {
-            (&set.regular, bold, italic)
+            (&set.regular, FaceIdx::Regular, bold, italic)
         } else {
             uncovered.push(c);
             continue;
         };
-        let (m, bmp) = face.font.rasterize(c, face.px);
-        if m.width == 0 || m.height == 0 {
+        let cached = cache.entry(GlyphKey { ch: c, face: idx }).or_insert_with(|| {
+            let (m, bmp) = face.font.rasterize(c, face.px);
+            if m.width == 0 || m.height == 0 {
+                None
+            } else {
+                Some((m, bmp))
+            }
+        });
+        let Some((m, bmp)) = cached else {
             continue;
-        }
+        };
         // ymin = offset of the bitmap's BOTTOM edge from the baseline, so the
         // top edge sits at baseline - (ymin + height).
         let top = baseline - (m.ymin + m.height as i32);
@@ -315,166 +556,27 @@ fn draw_symbol(
 }
 
 /// Render a validated frame to PNG bytes under `profile`.
+///
+/// One-shot convenience: constructs a fresh [`Renderer`] per call (5 font
+/// parses, cold glyph cache). Bulk gates should keep a `Renderer` instead.
 pub fn render_png(
     frame: &Frame,
     profile: &Profile,
     faces: &FontFaces<'_>,
 ) -> Result<Vec<u8>, RenderError> {
-    Ok(render_png_report(frame, profile, faces)?.png)
+    Renderer::new(profile, faces)?.render_png(frame)
 }
 
 /// Render plus exact coverage accounting (see [`Fidelity`]).
+///
+/// One-shot convenience: constructs a fresh [`Renderer`] per call (5 font
+/// parses, cold glyph cache). Bulk gates should keep a `Renderer` instead.
 pub fn render_png_report(
     frame: &Frame,
     profile: &Profile,
     faces: &FontFaces<'_>,
 ) -> Result<Rendered, RenderError> {
-    frame
-        .validate()
-        .map_err(|e| RenderError(format!("refusing to render: {e}")))?;
-    // Geometry pins are UNSCALED metrics; the gate compares against the
-    // profile constants directly.
-    let unscaled = load_font(faces.regular, profile.font_px)?;
-    verify_geometry(&unscaled, profile)?;
-
-    // HiDPI: rasterize glyphs at the final scale, no post upscale.
-    let u = profile.scale;
-    let set = FontSet::load(faces, profile.font_px * u as f32)?;
-    let cell_w = profile.cell_w * u;
-    let cell_h = profile.cell_h * u;
-    let pad = profile.pad * u;
-    let u_i = u as i32;
-
-    let w = frame.cols as u32 * cell_w + pad * 2;
-    let h = frame.rows as u32 * cell_h + pad * 2;
-    let bg = profile.default_bg;
-    let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([bg.r, bg.g, bg.b]));
-    let mut missing: Vec<MissingGlyph> = Vec::new();
-
-    for y in 0..frame.rows {
-        for x in 0..frame.cols {
-            let Some(cell) = frame.get(x, y) else {
-                continue;
-            };
-            if cell.continuation {
-                continue;
-            }
-            let (fg, cbg) = Frame::resolve_cell(cell, profile.default_fg, profile.default_bg);
-            let span = u32::from(cell.width.max(1)) * cell_w;
-            let cx = pad + x as u32 * cell_w;
-            let cy = pad + y as u32 * cell_h;
-            if cbg != profile.default_bg {
-                fill_rect(&mut img, cx, cy, span, cell_h, cbg);
-            }
-            if cell.mods.hidden || cell.symbol.trim().is_empty() {
-                continue;
-            }
-            let baseline = cy as i32 + set.regular.ascent.round() as i32;
-            draw_symbol(
-                &mut img,
-                &set,
-                &cell.symbol,
-                cx as i32,
-                baseline,
-                span,
-                cy as i32,
-                cell_h,
-                fg,
-                cell.mods.bold,
-                cell.mods.italic,
-                u_i,
-                Some((&mut missing, x, y)),
-            );
-            if cell.mods.underline {
-                let uy = (baseline + 2 * u_i).min((cy + cell_h - 1) as i32);
-                let th = if cell.mods.bold { 2 * u } else { u };
-                for t in 0..th {
-                    for dx in 0..span {
-                        blend(&mut img, cx + dx, (uy + t as i32) as u32, fg, 255);
-                    }
-                }
-            }
-            if cell.mods.strikethrough {
-                let sy = baseline - (set.regular.ascent * 0.35) as i32;
-                for t in 0..u {
-                    for dx in 0..span {
-                        blend(&mut img, cx + dx, (sy + t as i32).max(0) as u32, fg, 255);
-                    }
-                }
-            }
-        }
-    }
-
-    // Block cursor: fill cell with fg, redraw glyph in bg (classic terminal).
-    if frame.cursor.visible && profile.cursor_visible {
-        let mut cx = frame.cursor.x;
-        if frame
-            .get(cx, frame.cursor.y)
-            .is_some_and(|c| c.continuation)
-        {
-            cx = cx.saturating_sub(1);
-        }
-        if let Some(cell) = frame.get(cx, frame.cursor.y) {
-            let (fg, cbg) = Frame::resolve_cell(cell, profile.default_fg, profile.default_bg);
-            let span = u32::from(cell.width.max(1)) * cell_w;
-            let px = pad + cx as u32 * cell_w;
-            let py = pad + frame.cursor.y as u32 * cell_h;
-            let style = frame.cursor.style;
-            match style {
-                crate::frame::CursorStyle::Block => {
-                    fill_rect(&mut img, px, py, span, cell_h, fg);
-                    if !cell.mods.hidden && !cell.symbol.trim().is_empty() {
-                        let baseline = py as i32 + set.regular.ascent.round() as i32;
-                        draw_symbol(
-                            &mut img,
-                            &set,
-                            &cell.symbol,
-                            px as i32,
-                            baseline,
-                            span,
-                            py as i32,
-                            cell_h,
-                            cbg,
-                            false,
-                            false,
-                            u_i,
-                            None,
-                        );
-                    }
-                }
-                crate::frame::CursorStyle::Underline => {
-                    let uy = (py + cell_h - 2 * u) as i32;
-                    for t in 0..2 * u {
-                        for dx in 0..span {
-                            blend(&mut img, px + dx, (uy + t as i32) as u32, fg, 255);
-                        }
-                    }
-                }
-                crate::frame::CursorStyle::Bar => {
-                    for dx in 0..2 * u {
-                        for dy in 0..cell_h {
-                            blend(&mut img, px + dx, py + dy, fg, 255);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    image::DynamicImage::ImageRgb8(img)
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
-        .map_err(|e| RenderError(format!("PNG encode: {e}")))?;
-    let fidelity = Fidelity {
-        profile: profile.name.clone(),
-        font_sha256: profile.font_sha256.clone(),
-        font_desc: profile.font_desc.clone(),
-        scale: u,
-        approximate: !missing.is_empty() || !set.fell_back.is_empty(),
-        faces_fell_back: set.fell_back.iter().map(|s| s.to_string()).collect(),
-        missing,
-    };
-    Ok(Rendered { png: out, fidelity })
+    Renderer::new(profile, faces)?.render(frame)
 }
 
 fn esc_xml(s: &str) -> String {
@@ -568,7 +670,21 @@ pub fn render_svg(frame: &Frame, profile: &Profile) -> String {
             } else {
                 ""
             };
-            let attrs = format!("{weight}{style}");
+            // text-decoration paints across the whole run, spaces included —
+            // the same contract the PNG path follows for whitespace cells.
+            let mut deco = Vec::new();
+            if cell.mods.underline {
+                deco.push("underline");
+            }
+            if cell.mods.strikethrough {
+                deco.push("line-through");
+            }
+            let decoration = if deco.is_empty() {
+                String::new()
+            } else {
+                format!(" text-decoration=\"{}\"", deco.join(" "))
+            };
+            let attrs = format!("{weight}{style}{decoration}");
             s.push_str(&format!(
                 "<text xml:space=\"preserve\" x=\"{px}\" y=\"{}\" fill=\"{}\"{}>{}</text>\n",
                 py + ch - 4,

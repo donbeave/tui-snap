@@ -115,7 +115,16 @@ pub struct CompareOutcome {
     pub actual_frame: PathBuf,
     pub actual_png: PathBuf,
     pub expected_frame: PathBuf,
+    /// The approved PNG path, but only when it actually exists on disk
+    /// (when it was regenerated in memory this is `None` — see
+    /// [`Self::expected_png_bytes`] for the image either way).
     pub expected_png: Option<PathBuf>,
+    /// The exact expected image the pixel gate compared against — the
+    /// approved PNG's bytes when on disk, the regenerated render otherwise.
+    /// `None` only when there is no usable approved frame (missing/corrupt
+    /// approval). Reports embed this so the expected panel always shows the
+    /// gated image.
+    pub expected_png_bytes: Option<Vec<u8>>,
     pub diff_png: Option<PathBuf>,
     pub note: String,
 }
@@ -310,6 +319,9 @@ impl Store {
     ///
     /// `pixel_threshold`: strict gates pass 1.0; review passes lower it
     /// explicitly. Dimensions must match exactly either way.
+    ///
+    /// This constructs a fresh [`render::Renderer`] per call; bulk gates
+    /// should build one and call [`Self::check_with`] instead.
     pub fn check(
         &self,
         name: &str,
@@ -318,9 +330,21 @@ impl Store {
         faces: &crate::profile::FontFaces<'_>,
         pixel_threshold: f64,
     ) -> Result<CompareOutcome, SnapshotError> {
+        let mut renderer = render::Renderer::new(profile, faces)?;
+        self.check_with(&mut renderer, name, actual, pixel_threshold)
+    }
+
+    /// [`Self::check`] through a caller-owned [`render::Renderer`], so a
+    /// suite reuses the parsed faces and the glyph cache across checks.
+    pub fn check_with(
+        &self,
+        renderer: &mut render::Renderer,
+        name: &str,
+        actual: &Frame,
+        pixel_threshold: f64,
+    ) -> Result<CompareOutcome, SnapshotError> {
         actual.validate().map_err(SnapshotError::from)?;
-        let rendered =
-            render::render_png_report(actual, profile, faces).map_err(SnapshotError::from)?;
+        let rendered = renderer.render(actual).map_err(SnapshotError::from)?;
         let actual_png_bytes = &rendered.png;
         let actual_frame_path = self.actual_frame(name);
         let actual_png_path = self.actual_png(name);
@@ -347,6 +371,7 @@ impl Store {
             actual_png: actual_png_path,
             expected_frame: approved_frame_path.clone(),
             expected_png: None,
+            expected_png_bytes: None,
             diff_png: None,
             note: String::new(),
         };
@@ -422,13 +447,18 @@ impl Store {
         // rendered to MEMORY only: `check` never writes under `approved/`
         // (approvals change solely through explicit `accept`), so parallel
         // gates cannot race on approval files and renderer upgrades cannot
-        // silently heal them.
-        let approved_png_bytes = match std::fs::read(&approved_png_path) {
-            Ok(b) => b,
+        // silently heal them. The gated bytes are kept on the outcome
+        // (`expected_png_bytes`) so reports show the expected image even
+        // though nothing exists at `expected_png`'s former disk path.
+        let (approved_png_bytes, png_on_disk) = match std::fs::read(&approved_png_path) {
+            Ok(b) => (b, true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let rendered = render::render_png_report(&approved, profile, faces)?;
+                let rendered = renderer.render(&approved)?;
                 outcome.approved_png_regenerated = true;
-                rendered.png
+                outcome.note = "approved PNG not on disk; expected image regenerated in memory \
+                                from the approved frame"
+                    .to_string();
+                (rendered.png, false)
             }
             Err(e) => {
                 return Err(SnapshotError(format!(
@@ -437,8 +467,11 @@ impl Store {
                 )));
             }
         };
-        outcome.expected_png = Some(approved_png_path);
-        let verdict = diff::compare_png(&approved_png_bytes, &actual_png_bytes)?;
+        if png_on_disk {
+            outcome.expected_png = Some(approved_png_path);
+        }
+        let verdict = diff::compare_png(&approved_png_bytes, actual_png_bytes)?;
+        outcome.expected_png_bytes = Some(approved_png_bytes);
         if !verdict.dims_equal {
             outcome.status = Status::DimensionMismatch;
         } else {
@@ -498,6 +531,112 @@ impl Store {
             write_atomic(&dst, &bytes)?;
         }
         Ok(())
+    }
+
+    /// Assemble one report row from a check outcome: reads the actual
+    /// artifacts and base64-embeds the PNGs. The expected panel uses
+    /// [`CompareOutcome::expected_png_bytes`] — the exact image the pixel
+    /// gate compared against — so it renders even when the approved PNG was
+    /// regenerated in memory rather than read from disk.
+    pub fn report_entry(
+        &self,
+        outcome: &CompareOutcome,
+        profile: &Profile,
+    ) -> Result<ReportEntry, SnapshotError> {
+        use base64::Engine;
+        let b64 = &base64::engine::general_purpose::STANDARD;
+        let actual_png = std::fs::read(&outcome.actual_png).map_err(|e| {
+            SnapshotError(format!(
+                "cannot read actual PNG {}: {e}",
+                outcome.actual_png.display()
+            ))
+        })?;
+        let actual_compact = std::fs::read_to_string(&outcome.actual_frame).map_err(|e| {
+            SnapshotError(format!(
+                "cannot read actual frame {}: {e}",
+                outcome.actual_frame.display()
+            ))
+        })?;
+        let actual_frame = Frame::from_json(&actual_compact)?;
+        Ok(ReportEntry {
+            outcome: outcome.clone(),
+            expected_png_b64: outcome.expected_png_bytes.as_ref().map(|b| b64.encode(b)),
+            actual_png_b64: b64.encode(&actual_png),
+            diff_png_b64: outcome
+                .diff_png
+                .as_ref()
+                .and_then(|p| std::fs::read(p).ok())
+                .map(|b| b64.encode(&b)),
+            expected_frame_json: std::fs::read_to_string(&outcome.expected_frame).ok(),
+            actual_frame_json: actual_frame.to_json_pretty(),
+            actual_frame_compact: actual_compact,
+            profile_desc: profile.name.clone(),
+            font_sha256: profile.font_sha256.clone(),
+        })
+    }
+
+    /// Re-verify every actual frame in the store and rewrite `report.html` —
+    /// the library form of the CLI `report` subcommand. Unmatched gates do
+    /// not error here: inspect [`StoreReport::failed`] and the outcomes.
+    ///
+    /// This constructs a fresh [`render::Renderer`] per call; bulk callers
+    /// should build one and use [`Self::report_with`].
+    pub fn report(
+        &self,
+        profile: &Profile,
+        faces: &crate::profile::FontFaces<'_>,
+        pixel_threshold: f64,
+        title: &str,
+    ) -> Result<StoreReport, SnapshotError> {
+        let mut renderer = render::Renderer::new(profile, faces)?;
+        self.report_with(&mut renderer, pixel_threshold, title)
+    }
+
+    /// [`Self::report`] through a caller-owned [`render::Renderer`].
+    pub fn report_with(
+        &self,
+        renderer: &mut render::Renderer,
+        pixel_threshold: f64,
+        title: &str,
+    ) -> Result<StoreReport, SnapshotError> {
+        // A store with no actuals yet yields an empty report (CLI parity),
+        // while a genuinely unreadable directory stays an error.
+        let names = match self.actual_names() {
+            Ok(names) => names,
+            Err(_) if !self.root.join("actual").exists() => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        let mut entries = Vec::new();
+        let mut outcomes = Vec::new();
+        for name in names {
+            let text = std::fs::read_to_string(self.actual_frame(&name)).map_err(|e| {
+                SnapshotError(format!("cannot read actual frame for `{name}`: {e}"))
+            })?;
+            let frame = Frame::from_json(&text)?;
+            let outcome = self.check_with(renderer, &name, &frame, pixel_threshold)?;
+            entries.push(self.report_entry(&outcome, renderer.profile())?);
+            outcomes.push(outcome);
+        }
+        let path = write_report(self, title, &entries)?;
+        Ok(StoreReport { path, outcomes })
+    }
+}
+
+/// Result of [`Store::report`]/[`Store::report_with`]: the rewritten report
+/// plus every outcome it embeds.
+#[derive(Debug)]
+pub struct StoreReport {
+    /// Path of the rewritten `report.html`.
+    pub path: PathBuf,
+    /// One outcome per re-verified actual, in name order.
+    pub outcomes: Vec<CompareOutcome>,
+}
+
+impl StoreReport {
+    /// Outcomes that did not match (the CLI turns this into a non-zero exit).
+    #[must_use]
+    pub fn failed(&self) -> usize {
+        self.outcomes.iter().filter(|o| !o.status.matched()).count()
     }
 }
 
