@@ -9,10 +9,9 @@
 //!
 //! The old hand-written SGR replay parser is gone on purpose.
 //!
-//! Limits: `vt100` exposes no strikethrough query, so a strike-only change
-//! in a replayed stream is invisible on this path (the termlens PTY path
-//! preserves it). Blink/concealment follow the frozen-frame contract in
-//! [`crate::frame`].
+//! Raw replay preserves all cell attributes through the pinned vt100 patch.
+//! Cursor appearance remains unsupported here: use the PTY path when shape
+//! or blinking is part of the assertion. Position and visibility are retained.
 
 use crate::frame::{Cell, Color, Cursor, CursorStyle, Frame, Mods, Provenance, Rgb};
 
@@ -47,6 +46,18 @@ pub fn replay_raw(
             };
             if vt.is_wide_continuation() {
                 let mut cont = Cell::blank(c, r);
+                cont.fg = convert_color(vt.fgcolor());
+                cont.bg = convert_color(vt.bgcolor());
+                cont.mods = Mods {
+                    bold: vt.bold(),
+                    dim: vt.dim(),
+                    italic: vt.italic(),
+                    underline: vt.underline(),
+                    reverse: vt.inverse(),
+                    strikethrough: vt.strikethrough(),
+                    hidden: vt.hidden(),
+                    blink: vt.blink(),
+                };
                 cont.width = 0;
                 cont.continuation = true;
                 cont.symbol = String::new();
@@ -71,7 +82,9 @@ pub fn replay_raw(
                     dim: vt.dim(),
                     italic: vt.italic(),
                     underline: vt.underline(),
-                    strikethrough: false,
+                    strikethrough: vt.strikethrough(),
+                    hidden: vt.hidden(),
+                    blink: vt.blink(),
                     reverse: vt.inverse(),
                 },
             });

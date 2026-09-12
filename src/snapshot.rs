@@ -179,6 +179,12 @@ fn summarize(cell: &crate::frame::Cell) -> String {
         crate::frame::Rgb::new(0, 0, 0),
     );
     let mut mods = String::new();
+    if cell.mods.hidden {
+        mods.push_str("+hidden");
+    }
+    if cell.mods.blink {
+        mods.push_str("+blink");
+    }
     if cell.mods.bold {
         mods.push_str("+bold");
     }

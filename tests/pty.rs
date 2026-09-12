@@ -17,8 +17,13 @@ fn opts() -> PtyOptions {
 }
 
 fn fixture_bin() -> String {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/debug/examples/fixture_app")
+    std::env::current_exe()
+        .expect("test executable path")
+        .parent()
+        .expect("deps directory")
+        .parent()
+        .expect("profile directory")
+        .join("examples/fixture_app")
         .to_string_lossy()
         .into_owned()
 }

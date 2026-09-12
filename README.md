@@ -70,6 +70,17 @@ tuisnap run --cols 120 --rows 40 --send enter --wait-for Ready \
 `render` also accepts `--font-file` (hash recorded); all gates accept it too.
 Offline `frame.json` re-renders byte-identical PNGs (proven by tests).
 
+Git/path library dependencies include the pinned PTY engine and need no Cargo
+patches. Use `tuisnap::termlens` when constructing engine types for
+`frame_from_screen`. See `docs/MIGRATION.md` for schema 3 and fixture migration.
+
+Consumer and migration gates:
+
+```text
+cargo run --locked --manifest-path tests/fixtures/consumer/Cargo.toml
+python3 tools/test_migration.py
+```
+
 ## Layout of a store
 
 ```text
