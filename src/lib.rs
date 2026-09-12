@@ -12,9 +12,15 @@
 //! expected/actual/diff reports ([`snapshot`]). A changed snapshot requires
 //! explicit review ([`snapshot::Store::accept`]); CI never auto-blesses.
 //! Equality only validates the fixtures covered — not every app state.
+//!
+//! Suites that prefer nested scenario names and committed text/HTML
+//! artifacts can use [`grouped::GroupedStore`]: four artifacts per scenario
+//! (`.ansi` / `.txt` / `.png` / `.html`), recursive accept and report, same
+//! statuses and renderer.
 
 pub mod diff;
 pub mod frame;
+pub mod grouped;
 pub mod profile;
 pub mod ratatui;
 pub mod render;
@@ -31,6 +37,7 @@ pub mod pty;
 pub use termlens;
 
 pub use frame::{Cell, Color, Cursor, CursorStyle, Frame, FrameError, Mods, Provenance, Rgb};
+pub use grouped::{ArtifactPaths, GroupedOutcome, GroupedStore, InvalidName};
 pub use profile::{
     FontFaces, Profile, VENDORED_FACES, VENDORED_FONT, VENDORED_FONT_BOLD,
     VENDORED_FONT_BOLD_ITALIC, VENDORED_FONT_ITALIC,

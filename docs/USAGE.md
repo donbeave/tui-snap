@@ -127,6 +127,61 @@ cargo test                                  # green
 report. Acceptance is an explicit command — there is no environment
 variable that approves anything (a test asserts exactly this).
 
+## Grouped multi-artifact store
+
+`tuisnap::grouped::GroupedStore` is an alternative store for suites that
+want nested scenario names and a committed tree of human-reviewable
+artifacts instead of frame JSON. A scenario name is a slash-separated path
+(`showcase/pages/overview_120x40_truecolor`); each scenario commits EXACTLY
+four artifacts under the approved root — no `.frame.json`, no sidecars:
+
+```text
+snapshots/showcase/pages/overview_120x40_truecolor.ansi   # normalized SGR dump (cell-exact gate)
+snapshots/showcase/pages/overview_120x40_truecolor.txt    # plain black-and-white text
+snapshots/showcase/pages/overview_120x40_truecolor.png    # colored image (pixel gate)
+snapshots/showcase/pages/overview_120x40_truecolor.html   # standalone colored HTML render
+```
+
+```rust
+use tuisnap::grouped::GroupedStore;
+
+let store = GroupedStore::new(std::path::Path::new("tests/snapshots"));
+// scratch defaults: tests/snapshots.actual/, tests/snapshots.diff/,
+// report at tests/snapshots.actual/report.html — override with
+// .with_actual_root(...) / .with_diff_root(...) / .with_report_path(...)
+// (e.g. under target/; never inside the approved tree).
+let mut renderer = profile.renderer(&VENDORED_FACES)?;
+let outcome = store.check_with(&mut renderer, "pages/overview", &frame, 1.0)?;
+outcome.ensure_matched()?;
+```
+
+Gate semantics per check (actuals + debug `<name>.frame.json` /
+`.png.fidelity.json` sidecars are written to the actual root FIRST):
+
+1. `.ansi` byte-compare — the cell-exact gate (symbol + fg + bg + mods per
+   cell, deterministic). Failure reads as `CellsDiffer`.
+2. `.txt` byte-compare — content gate: a style-only change shows as
+   `ansi_match: Some(false)` with `txt_match: Some(true)`.
+3. `.html` byte-compare — the render-level gate: identical cells through a
+   changed renderer/font fail here as `PixelsDiffer`. The HTML embeds the
+   frame JSON with the provenance timestamp zeroed, so identical screens
+   serialize byte-identically (`Renderer::render_html` documents this).
+4. `.png` decoded-pixel compare with the same threshold semantics as the
+   classic store; the diff PNG lands under the diff root.
+
+Any missing approved artifact is `MissingApproval` (fail-closed). Names are
+validated everywhere: absolute paths, `..`/`.` segments, empty segments and
+backslashes are rejected with `InvalidName`. Blessing is recursive:
+
+```text
+tuisnap accept --grouped --store snapshots --all        # or --name pages/overview
+tuisnap report --grouped --store snapshots [--report-path target/report.html]
+tuisnap check  --grouped --store snapshots --name pages/overview --input f.frame.json
+```
+
+The classic `Store` is untouched; both stores share `Status`,
+`CompareOutcome`, the report machinery and the renderer.
+
 ## CLI reference
 
 ```text
@@ -139,6 +194,11 @@ tuisnap run     --cols C --rows R [--send STEP]... [--wait-for T] [--timeout-ms 
   [--settle-ms N] [--format F]... --out PREFIX [--store DIR --name N] [--font-file TTF]
   -- CMD [ARGS...]
 ```
+
+`check`, `accept` and `report` take `--grouped` for the grouped
+multi-artifact store (`report` then also takes `--report-path`); `accept
+--grouped --all` walks nested scenario names recursively. Without
+`--grouped` the CLI drives the classic store exactly as before.
 
 `report` re-verifies every `actual/*.frame.json` and rewrites the index —
 use it in CI to publish one HTML artifact per run.

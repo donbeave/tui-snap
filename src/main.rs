@@ -51,6 +51,10 @@ enum Cmd {
         input: PathBuf,
         #[arg(long, default_value_t = 1.0)]
         pixel_threshold: f64,
+        /// Grouped multi-artifact store (see docs/USAGE.md): --store is the
+        /// approved root holding <name>.{ansi,txt,png,html} only.
+        #[arg(long, default_value_t = false)]
+        grouped: bool,
         /// Override the pinned profile font (hash recorded in the report).
         #[arg(long)]
         font_file: Option<PathBuf>,
@@ -63,6 +67,10 @@ enum Cmd {
         name: Option<String>,
         #[arg(long, default_value_t = false)]
         all: bool,
+        /// Grouped multi-artifact store: --all walks nested names
+        /// recursively (e.g. showcase/pages/overview_120x40_truecolor).
+        #[arg(long, default_value_t = false)]
+        grouped: bool,
     },
     /// Re-verify every actual frame in the store and rewrite the report.
     Report {
@@ -72,6 +80,13 @@ enum Cmd {
         title: String,
         #[arg(long, default_value_t = 1.0)]
         pixel_threshold: f64,
+        /// Grouped multi-artifact store: re-verifies nested actuals and
+        /// writes the report under the store's scratch area (not approved/).
+        #[arg(long, default_value_t = false)]
+        grouped: bool,
+        /// Grouped stores only: explicit report output path.
+        #[arg(long)]
+        report_path: Option<PathBuf>,
         /// Override the pinned profile font (hash recorded in the report).
         #[arg(long)]
         font_file: Option<PathBuf>,
@@ -156,26 +171,29 @@ impl OwnedFaces {
     }
 }
 
-fn esc_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+/// The cached [`tuisnap::render::Renderer`] shared across formats, so
+/// `--format png --format html` parses the faces once.
+fn renderer_cached<'a>(
+    slot: &'a mut Option<tuisnap::Renderer>,
+    profile: &tuisnap::Profile,
+    faces: &tuisnap::FontFaces<'_>,
+) -> Result<&'a mut tuisnap::Renderer> {
+    if slot.is_none() {
+        *slot = Some(tuisnap::Renderer::new(profile, faces).map_err(|e| anyhow::anyhow!("{e}"))?);
+    }
+    Ok(slot.as_mut().expect("constructed above"))
 }
 
-/// Render `frame` through a lazily constructed [`tuisnap::render::Renderer`]
-/// shared across formats, so `--format png --format html` parses the faces
-/// once.
+/// Render `frame` through [`renderer_cached`].
 fn render_cached(
     slot: &mut Option<tuisnap::Renderer>,
     frame: &tuisnap::Frame,
     profile: &tuisnap::Profile,
     faces: &tuisnap::FontFaces<'_>,
 ) -> Result<tuisnap::render::Rendered> {
-    if slot.is_none() {
-        *slot = Some(tuisnap::Renderer::new(profile, faces).map_err(|e| anyhow::anyhow!("{e}"))?);
-    }
-    let r = slot.as_mut().expect("constructed above");
-    r.render(frame).map_err(|e| anyhow::anyhow!("{e}"))
+    renderer_cached(slot, profile, faces)?
+        .render(frame)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn render_formats(
@@ -203,23 +221,12 @@ fn render_formats(
             "json" => std::fs::write(&path, frame.to_json())?,
             "svg" => std::fs::write(&path, tuisnap::render::render_svg(frame, profile))?,
             "html" => {
-                // Standalone view: selectable SVG as the primary visual, the
-                // authoritative PNG kept under <details>, frame JSON embedded
-                // for lossless re-import.
-                let rendered = render_cached(&mut renderer, frame, profile, faces)?;
-                let b64 =
-                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &rendered.png);
-                let (png_w, _) = profile.image_size(frame.cols, frame.rows);
-                let svg = tuisnap::render::render_svg(frame, profile).replacen(
-                    "<svg ",
-                    &format!("<svg style=\"width:{png_w}px;height:auto\" "),
-                    1,
-                );
-                let html = format!(
-                    "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{background:#141414;margin:24px}}svg{{display:block}}details{{color:#ccc;margin-top:12px}}img{{max-width:100%}}</style></head><body>{svg}<details><summary>authoritative PNG (pixel-gate evidence)</summary><img src=\"data:image/png;base64,{b64}\" alt=\"frame\"></details><script type=\"application/json\">{}</script></body></html>",
-                    esc_html(name),
-                    tuisnap::snapshot::json_for_script(&frame.to_json())
-                );
+                // Standalone colored render, built by the library
+                // (`Renderer::render_html`): selectable SVG primary visual,
+                // authoritative PNG under <details>, frame JSON embedded.
+                let html = renderer_cached(&mut renderer, profile, faces)?
+                    .render_html(frame, name)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 std::fs::write(&path, html)?;
             }
             "png" => {
@@ -268,47 +275,98 @@ fn main() -> Result<()> {
             name,
             input,
             pixel_threshold,
+            grouped,
             font_file,
         } => {
             let (owned, profile) = load_font_bytes(font_file.as_ref())?;
             let text = std::fs::read_to_string(&input)
                 .with_context(|| format!("read {}", input.display()))?;
             let frame = tuisnap::Frame::from_json(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let st = tuisnap::snapshot::Store::new(&store);
-            let outcome = st.check(&name, &frame, &profile, &owned.faces(), pixel_threshold)?;
-            let entry = st.report_entry(&outcome, &profile)?;
-            let report = tuisnap::snapshot::write_report(&st, "tuisnap visual report", &[entry])?;
-            eprintln!("report: {}", report.display());
-            outcome
-                .ensure_matched()
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if grouped {
+                let st = tuisnap::grouped::GroupedStore::new(&store);
+                let outcome =
+                    st.check(&name, &frame, &profile, &owned.faces(), pixel_threshold)?;
+                let entry = tuisnap::snapshot::report_entry(&outcome.outcome, &profile)?;
+                let report =
+                    tuisnap::snapshot::write_report_at(&st.report_path(), "tuisnap visual report", &[entry])?;
+                eprintln!("report: {}", report.display());
+                outcome
+                    .ensure_matched()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            } else {
+                let st = tuisnap::snapshot::Store::new(&store);
+                let outcome = st.check(&name, &frame, &profile, &owned.faces(), pixel_threshold)?;
+                let entry = st.report_entry(&outcome, &profile)?;
+                let report =
+                    tuisnap::snapshot::write_report(&st, "tuisnap visual report", &[entry])?;
+                eprintln!("report: {}", report.display());
+                outcome
+                    .ensure_matched()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
             println!("matched: {name}");
         }
-        Cmd::Accept { store, name, all } => {
-            let st = tuisnap::snapshot::Store::new(&store);
-            if all {
-                for n in st.actual_names()? {
+        Cmd::Accept {
+            store,
+            name,
+            all,
+            grouped,
+        } => {
+            if grouped {
+                let st = tuisnap::grouped::GroupedStore::new(&store);
+                if all {
+                    for n in st.accept_all()? {
+                        println!("accepted: {n}");
+                    }
+                } else if let Some(n) = name {
                     st.accept(&n)?;
                     println!("accepted: {n}");
+                } else {
+                    anyhow::bail!("pass --name or --all");
                 }
-            } else if let Some(n) = name {
-                st.accept(&n)?;
-                println!("accepted: {n}");
             } else {
-                anyhow::bail!("pass --name or --all");
+                let st = tuisnap::snapshot::Store::new(&store);
+                if all {
+                    for n in st.actual_names()? {
+                        st.accept(&n)?;
+                        println!("accepted: {n}");
+                    }
+                } else if let Some(n) = name {
+                    st.accept(&n)?;
+                    println!("accepted: {n}");
+                } else {
+                    anyhow::bail!("pass --name or --all");
+                }
             }
         }
         Cmd::Report {
             store,
             title,
             pixel_threshold,
+            grouped,
+            report_path,
             font_file,
         } => {
             let (owned, profile) = load_font_bytes(font_file.as_ref())?;
-            let st = tuisnap::snapshot::Store::new(&store);
-            let report = st.report(&profile, &owned.faces(), pixel_threshold, &title)?;
-            let failed = report.failed() as u32;
-            println!("report: {} ({} failed)", report.path.display(), failed);
+            let (path, failed) = if grouped {
+                let mut st = tuisnap::grouped::GroupedStore::new(&store);
+                if let Some(p) = report_path {
+                    st = st.with_report_path(&p);
+                }
+                let report = st.report(&profile, &owned.faces(), pixel_threshold, &title)?;
+                let failed = report.failed() as u32;
+                (report.path, failed)
+            } else {
+                anyhow::ensure!(
+                    report_path.is_none(),
+                    "--report-path only applies to --grouped stores"
+                );
+                let st = tuisnap::snapshot::Store::new(&store);
+                let report = st.report(&profile, &owned.faces(), pixel_threshold, &title)?;
+                let failed = report.failed() as u32;
+                (report.path, failed)
+            };
+            println!("report: {} ({} failed)", path.display(), failed);
             if failed > 0 {
                 anyhow::bail!("{failed} snapshot(s) require review");
             }

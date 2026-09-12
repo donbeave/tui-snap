@@ -543,36 +543,7 @@ impl Store {
         outcome: &CompareOutcome,
         profile: &Profile,
     ) -> Result<ReportEntry, SnapshotError> {
-        use base64::Engine;
-        let b64 = &base64::engine::general_purpose::STANDARD;
-        let actual_png = std::fs::read(&outcome.actual_png).map_err(|e| {
-            SnapshotError(format!(
-                "cannot read actual PNG {}: {e}",
-                outcome.actual_png.display()
-            ))
-        })?;
-        let actual_compact = std::fs::read_to_string(&outcome.actual_frame).map_err(|e| {
-            SnapshotError(format!(
-                "cannot read actual frame {}: {e}",
-                outcome.actual_frame.display()
-            ))
-        })?;
-        let actual_frame = Frame::from_json(&actual_compact)?;
-        Ok(ReportEntry {
-            outcome: outcome.clone(),
-            expected_png_b64: outcome.expected_png_bytes.as_ref().map(|b| b64.encode(b)),
-            actual_png_b64: b64.encode(&actual_png),
-            diff_png_b64: outcome
-                .diff_png
-                .as_ref()
-                .and_then(|p| std::fs::read(p).ok())
-                .map(|b| b64.encode(&b)),
-            expected_frame_json: std::fs::read_to_string(&outcome.expected_frame).ok(),
-            actual_frame_json: actual_frame.to_json_pretty(),
-            actual_frame_compact: actual_compact,
-            profile_desc: profile.name.clone(),
-            font_sha256: profile.font_sha256.clone(),
-        })
+        report_entry(outcome, profile)
     }
 
     /// Re-verify every actual frame in the store and rewrite `report.html` —
@@ -620,6 +591,46 @@ impl Store {
         let path = write_report(self, title, &entries)?;
         Ok(StoreReport { path, outcomes })
     }
+}
+
+/// Assemble one report row from a check outcome: reads the actual artifacts
+/// and base64-embeds the PNGs. Free-function form of [`Store::report_entry`]
+/// so non-classic stores (e.g. [`crate::grouped::GroupedStore`]) can build
+/// rows for [`write_report_at`] without a [`Store`].
+pub fn report_entry(
+    outcome: &CompareOutcome,
+    profile: &Profile,
+) -> Result<ReportEntry, SnapshotError> {
+    use base64::Engine;
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let actual_png = std::fs::read(&outcome.actual_png).map_err(|e| {
+        SnapshotError(format!(
+            "cannot read actual PNG {}: {e}",
+            outcome.actual_png.display()
+        ))
+    })?;
+    let actual_compact = std::fs::read_to_string(&outcome.actual_frame).map_err(|e| {
+        SnapshotError(format!(
+            "cannot read actual frame {}: {e}",
+            outcome.actual_frame.display()
+        ))
+    })?;
+    let actual_frame = Frame::from_json(&actual_compact)?;
+    Ok(ReportEntry {
+        outcome: outcome.clone(),
+        expected_png_b64: outcome.expected_png_bytes.as_ref().map(|b| b64.encode(b)),
+        actual_png_b64: b64.encode(&actual_png),
+        diff_png_b64: outcome
+            .diff_png
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .map(|b| b64.encode(&b)),
+        expected_frame_json: std::fs::read_to_string(&outcome.expected_frame).ok(),
+        actual_frame_json: actual_frame.to_json_pretty(),
+        actual_frame_compact: actual_compact,
+        profile_desc: profile.name.clone(),
+        font_sha256: profile.font_sha256.clone(),
+    })
 }
 
 /// Result of [`Store::report`]/[`Store::report_with`]: the rewritten report
@@ -673,6 +684,17 @@ pub fn json_for_script(json: &str) -> String {
 /// re-import, cell diagnostics as a table.
 pub fn write_report(
     store: &Store,
+    title: &str,
+    entries: &[ReportEntry],
+) -> Result<PathBuf, SnapshotError> {
+    write_report_at(&store.root.join("report.html"), title, entries)
+}
+
+/// [`write_report`] with an explicit output path, for stores whose report
+/// does not live at a fixed location (e.g. [`crate::grouped::GroupedStore`],
+/// which keeps its report out of the approved tree).
+pub fn write_report_at(
+    path: &Path,
     title: &str,
     entries: &[ReportEntry],
 ) -> Result<PathBuf, SnapshotError> {
@@ -752,7 +774,6 @@ pub fn write_report(
         esc_html(title),
         esc_html(title)
     );
-    let path = store.root.join("report.html");
-    write_atomic(&path, html.as_bytes())?;
-    Ok(path)
+    write_atomic(path, html.as_bytes())?;
+    Ok(path.to_path_buf())
 }

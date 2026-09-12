@@ -166,6 +166,24 @@ pub struct Rendered {
     pub fidelity: Fidelity,
 }
 
+/// The four snapshot artifacts of one frame, generated in one render pass:
+/// the normalized SGR dump ([`ansi_dump`]), plain text ([`Frame::text`]), the
+/// standalone HTML view ([`Renderer::render_html`]) and the authoritative
+/// PNG. Bytes are deterministic for identical frames (the HTML embed
+/// normalizes the provenance timestamp — see [`Renderer::render_html`]).
+pub struct Artifacts {
+    /// Colored terminal text (normalized SGR dump).
+    pub ansi: String,
+    /// Plain black-and-white text.
+    pub txt: String,
+    /// Standalone colored HTML render.
+    pub html: String,
+    /// Colored image (authoritative pixel-gate evidence).
+    pub png: Vec<u8>,
+    /// Coverage accounting of the PNG render.
+    pub fidelity: Fidelity,
+}
+
 /// Glyph rasters keyed by character and face, negative results included
 /// (`None` = rasterized once to an empty bitmap — never re-rasterized).
 type GlyphCache = std::collections::HashMap<GlyphKey, Option<(fontdue::Metrics, Vec<u8>)>>;
@@ -241,6 +259,37 @@ impl Renderer {
     /// Render a validated frame to PNG bytes.
     pub fn render_png(&mut self, frame: &Frame) -> Result<Vec<u8>, RenderError> {
         Ok(self.render(frame)?.png)
+    }
+
+    /// Standalone colored HTML render of a frame: the selectable SVG as the
+    /// primary visual, the authoritative PNG embedded as base64 under
+    /// `<details>`, and the canonical frame JSON embedded in a
+    /// `<script type="application/json">` element for lossless re-import.
+    ///
+    /// The embedded JSON carries `provenance.created_unix = 0`: the timestamp
+    /// is informational only (excluded from every gate by design), and
+    /// zeroing it keeps the document byte-deterministic for identical
+    /// screens. Every other field is preserved.
+    pub fn render_html(&mut self, frame: &Frame, title: &str) -> Result<String, RenderError> {
+        let rendered = self.render(frame)?;
+        Ok(html_document(frame, &self.profile, title, &rendered.png))
+    }
+
+    /// Generate all four snapshot artifacts in one render pass (the PNG is
+    /// rasterized once and shared by the HTML embed and the PNG artifact).
+    pub fn render_artifacts(
+        &mut self,
+        frame: &Frame,
+        title: &str,
+    ) -> Result<Artifacts, RenderError> {
+        let rendered = self.render(frame)?;
+        Ok(Artifacts {
+            ansi: ansi_dump(frame),
+            txt: frame.text(),
+            html: html_document(frame, &self.profile, title, &rendered.png),
+            png: rendered.png,
+            fidelity: rendered.fidelity,
+        })
     }
 
     /// Render plus exact coverage accounting (see [`Fidelity`]).
@@ -699,10 +748,31 @@ pub fn render_svg(frame: &Frame, profile: &Profile) -> String {
     s
 }
 
+/// Build the standalone HTML document for a frame from an already-rendered
+/// PNG (shared by [`Renderer::render_html`] and [`Renderer::render_artifacts`]
+/// so the PNG is rasterized once). See [`Renderer::render_html`] for the
+/// determinism contract of the embedded frame JSON.
+fn html_document(frame: &Frame, profile: &Profile, title: &str, png: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+    let (png_w, _) = profile.image_size(frame.cols, frame.rows);
+    let svg = render_svg(frame, profile).replacen(
+        "<svg ",
+        &format!("<svg style=\"width:{png_w}px;height:auto\" "),
+        1,
+    );
+    let mut embedded = frame.clone();
+    embedded.provenance.created_unix = 0;
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{background:#141414;margin:24px}}svg{{display:block}}details{{color:#ccc;margin-top:12px}}img{{max-width:100%}}</style></head><body>{svg}<details><summary>authoritative PNG (pixel-gate evidence)</summary><img src=\"data:image/png;base64,{b64}\" alt=\"frame\"></details><script type=\"application/json\">{}</script></body></html>",
+        esc_xml(title),
+        crate::snapshot::json_for_script(&embedded.to_json())
+    )
+}
+
 /// Normalized ANSI dump (SGR runs from canonical state — for debugging, not
 /// for replay; replay raw streams with [`crate::ansi::replay_raw`]).
-pub fn ansi_dump(frame: &Frame) -> String {
-    let mut out = String::new();
+pub fn ansi_dump(frame: &Frame) -> String {    let mut out = String::new();
     for y in 0..frame.rows {
         let mut cur = String::new();
         for x in 0..frame.cols {

@@ -112,6 +112,47 @@ python3 tools/test_migration.py
 
 Approved PNGs regenerate deterministically and are not committed.
 
+## Grouped multi-artifact store
+
+`tuisnap::grouped::GroupedStore` is an alternative store for suites that
+want nested scenario names and committed, human-reviewable artifacts. A
+scenario `<group>/<sub_group>/<name>` commits EXACTLY four files under the
+approved root — no `.frame.json`, no sidecars:
+
+```text
+snapshots/showcase/pages/overview_120x40_truecolor.ansi   # normalized SGR dump (cell-exact gate)
+snapshots/showcase/pages/overview_120x40_truecolor.txt    # plain black-and-white text
+snapshots/showcase/pages/overview_120x40_truecolor.png    # colored image (pixel gate)
+snapshots/showcase/pages/overview_120x40_truecolor.html   # standalone colored HTML render
+```
+
+```rust
+let store = tuisnap::grouped::GroupedStore::new(std::path::Path::new("tests/snapshots"));
+let mut renderer = profile.renderer(&VENDORED_FACES)?;
+let outcome = store.check_with(&mut renderer, "pages/overview", &frame, 1.0)?;
+outcome.ensure_matched()?;
+store.report_with(&mut renderer, 1.0, "my suite")?;   // HTML report, outside approved/
+```
+
+Actuals (`snapshots.actual/`), diff PNGs (`snapshots.diff/`) and the report
+(`snapshots.actual/report.html` by default) live OUTSIDE the approved tree
+— override with `with_actual_root` / `with_diff_root` / `with_report_path`
+(e.g. under `target/`). Gates: `.ansi`/`.txt`/`.html` byte-compares (the
+ansi dump is the cell-exact gate; html catches renderer changes) plus the
+same decoded-pixel PNG gate as the classic store. Missing approvals fail
+closed; names with absolute paths, `..`, empty segments or backslashes are
+rejected. Bless recursively from the CLI:
+
+```text
+tuisnap accept --grouped --store snapshots --all
+tuisnap report --grouped --store snapshots --report-path target/report.html
+```
+
+The classic `Store` above is fully unaffected; both share statuses, the
+report machinery and the renderer. See `docs/USAGE.md` for gate semantics
+in detail.
+
+
 ## Fidelity contract
 
 - Layout from frame widths (CJK keeps 2 cells even as tofu); real glyphs via
