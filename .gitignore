@@ -8,4 +8,5 @@ tests/visual/actual/
 tests/visual/diff/
 tests/visual/report.html
 tests/visual/approved/*.png
+tests/visual/approved/*.png.fidelity.json
 vendor/termlens/Cargo.lock

@@ -1,22 +1,30 @@
 //! Pinned-profile rendering: canonical [`Frame`] → PNG / SVG / ANSI / text.
 //!
 //! The PNG path rasterizes **real glyphs** with `fontdue` from pinned font
-//! bytes — never placeholder blocks. [`verify_geometry`] fails loudly if the
-//! font's measured advance/line-height drifts from the profile constants, so
-//! a font change reads as a renderer change, not an app regression.
+//! bytes — never placeholder blocks. Glyphs are rasterized at the FINAL scale
+//! (`font_px * scale`) straight onto the output image, so HiDPI output keeps
+//! real font hinting/coverage gradations instead of nearest-neighbor 2×2
+//! blocks. [`verify_geometry`] fails loudly if the regular face's measured
+//! advance/line-height drifts from the profile constants, so a font change
+//! reads as a renderer change, not an app regression.
 //!
 //! Fidelity contract (measured, terminal-like — NOT pixel-identity with any
 //! particular terminal emulator):
 //! - layout from frame widths (wide = 2 cells, continuation = 0); CJK keeps
 //!   2-cell geometry even when the glyph is missing (tofu fallback);
-//! - faux-bold via double-strike, faux-italic via shear (documented
-//!   approximations; the cell data stays authoritative for styles);
+//! - bold / italic / bold-italic use the REAL faces of the pinned family
+//!   (faux double-strike / shear survive only as fallback when a face fails
+//!   to load or the family is a single-face override);
 //! - underline / strikethrough drawn at fixed offsets from the baseline;
-//! - blink frozen as visible; concealed glyphs omitted (see [`crate::frame`]).
+//! - blink frozen as visible; concealed glyphs omitted (see [`crate::frame`]);
+//! - glyphs no face in the chain covers draw a deterministic tofu box AND are
+//!   reported in the [`Fidelity`] record (the `.png.fidelity.json` sidecar) —
+//!   exact/missing reporting, never silent tofu.
 
 use crate::frame::{Frame, Rgb};
-use crate::profile::Profile;
+use crate::profile::{FontFaces, Profile};
 use fontdue::{Font, FontSettings};
+use serde::Serialize;
 
 /// Import/render failure: explicit, never silent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +82,89 @@ pub fn verify_geometry(loaded: &LoadedFont, profile: &Profile) -> Result<(), Ren
     Ok(())
 }
 
+/// The four faces of one family, loaded at one pixel size. Faces share the
+/// regular face's baseline (cell grid authority). A non-regular face that
+/// fails to parse falls back to the regular face and is named in
+/// `fell_back` (the faux styles then return for it).
+pub struct FontSet {
+    pub regular: LoadedFont,
+    pub bold: LoadedFont,
+    pub italic: LoadedFont,
+    pub bold_italic: LoadedFont,
+    /// Non-regular faces that failed to parse and fell back to regular.
+    pub fell_back: Vec<&'static str>,
+}
+
+impl FontSet {
+    pub fn load(faces: &FontFaces<'_>, px: f32) -> Result<Self, RenderError> {
+        let regular = load_font(faces.regular, px)?;
+        let mut fell_back = Vec::new();
+        let mut face = |bytes: &[u8], name: &'static str| match load_font(bytes, px) {
+            Ok(f) => f,
+            Err(_) => {
+                fell_back.push(name);
+                load_font(faces.regular, px).expect("regular face parsed above")
+            }
+        };
+        Ok(Self {
+            bold: face(faces.bold, "bold"),
+            italic: face(faces.italic, "italic"),
+            bold_italic: face(faces.bold_italic, "bold_italic"),
+            regular,
+            fell_back,
+        })
+    }
+
+    /// The face `cell.mods` selects, before per-glyph coverage fallback.
+    fn styled(&self, bold: bool, italic: bool) -> &LoadedFont {
+        match (bold, italic) {
+            (true, true) => &self.bold_italic,
+            (true, false) => &self.bold,
+            (false, true) => &self.italic,
+            (false, false) => &self.regular,
+        }
+    }
+}
+
+/// One cell whose glyph(s) no face in the chain covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissingGlyph {
+    pub x: u16,
+    pub y: u16,
+    pub symbol: String,
+    /// Uncovered codepoints, formatted `U+26B7`.
+    pub codepoints: Vec<String>,
+}
+
+/// Exact coverage accounting for one rendered frame — written next to PNG
+/// outputs as `<name>.png.fidelity.json`. `approximate` is true when any
+/// glyph is missing or any styled face fell back (mirroring the legacy
+/// sidecar's purpose: a PNG is labelled approximate when it must be).
+#[derive(Debug, Clone, Serialize)]
+pub struct Fidelity {
+    pub profile: String,
+    pub font_sha256: String,
+    pub font_desc: String,
+    pub scale: u32,
+    pub approximate: bool,
+    /// Styled faces that failed to parse and fell back to regular.
+    pub faces_fell_back: Vec<String>,
+    pub missing: Vec<MissingGlyph>,
+}
+
+impl Fidelity {
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).expect("Fidelity is plain serializable data")
+    }
+}
+
+/// A rendered PNG plus its fidelity record.
+pub struct Rendered {
+    pub png: Vec<u8>,
+    pub fidelity: Fidelity,
+}
+
 fn blend(dst: &mut image::RgbImage, x: u32, y: u32, fg: Rgb, cov: u8) {
     if cov == 0 {
         return;
@@ -101,37 +192,38 @@ fn fill_rect(dst: &mut image::RgbImage, x: u32, y: u32, w: u32, h: u32, c: Rgb) 
     }
 }
 
-/// Deterministic tofu box for missing glyphs (spans `span_px` wide).
-fn draw_tofu(dst: &mut image::RgbImage, x0: i32, top: i32, span_px: u32, h: u32, fg: Rgb) {
-    let w = span_px.saturating_sub(2).max(3);
+/// Deterministic tofu box for missing glyphs (spans `span_px` wide). `u` is
+/// the scale unit: insets are one unscaled pixel.
+fn draw_tofu(dst: &mut image::RgbImage, x0: i32, top: i32, span_px: u32, h: u32, fg: Rgb, u: i32) {
+    let w = (span_px as i32 - 2 * u).max(3 * u);
     for dx in 0..w {
         blend(
             dst,
-            (x0 + 1 + dx as i32).max(0) as u32,
+            (x0 + u + dx).max(0) as u32,
             top.max(0) as u32,
             fg,
             255,
         );
         blend(
             dst,
-            (x0 + 1 + dx as i32).max(0) as u32,
-            (top + h as i32 - 1).max(0) as u32,
+            (x0 + u + dx).max(0) as u32,
+            (top + h as i32 - u).max(0) as u32,
             fg,
             255,
         );
     }
-    for dy in 0..h {
+    for dy in 0..h as i32 {
         blend(
             dst,
-            (x0 + 1).max(0) as u32,
-            (top + dy as i32).max(0) as u32,
+            (x0 + u).max(0) as u32,
+            (top + dy).max(0) as u32,
             fg,
             255,
         );
         blend(
             dst,
-            (x0 + 1 + w as i32 - 1).max(0) as u32,
-            (top + dy as i32).max(0) as u32,
+            (x0 + u + w - u).max(0) as u32,
+            (top + dy).max(0) as u32,
             fg,
             255,
         );
@@ -140,10 +232,13 @@ fn draw_tofu(dst: &mut image::RgbImage, x0: i32, top: i32, span_px: u32, h: u32,
 
 /// Draw one lead-cell symbol at pen origin. Combining scalars overlay at the
 /// same origin (documented approximation of terminal combining behavior).
+/// Face chain: styled face → regular face → tofu (recorded in `missing`
+/// when `Some`). Faux styles apply only when the regular face serves a cell
+/// whose mods asked for a styled face.
 #[allow(clippy::too_many_arguments)]
 fn draw_symbol(
     dst: &mut image::RgbImage,
-    loaded: &LoadedFont,
+    set: &FontSet,
     symbol: &str,
     pen_x: i32,
     baseline: i32,
@@ -153,20 +248,21 @@ fn draw_symbol(
     fg: Rgb,
     bold: bool,
     italic: bool,
+    u: i32,
+    missing: Option<(&mut Vec<MissingGlyph>, u16, u16)>,
 ) {
+    let styled = set.styled(bold, italic);
+    let mut uncovered: Vec<char> = Vec::new();
     for c in symbol.chars() {
-        if loaded.font.lookup_glyph_index(c) == 0 {
-            draw_tofu(
-                dst,
-                pen_x,
-                cell_top + 2,
-                span_px,
-                cell_h.saturating_sub(4),
-                fg,
-            );
+        let (face, faux_bold, faux_italic) = if styled.font.lookup_glyph_index(c) != 0 {
+            (styled, false, false)
+        } else if set.regular.font.lookup_glyph_index(c) != 0 {
+            (&set.regular, bold, italic)
+        } else {
+            uncovered.push(c);
             continue;
-        }
-        let (m, bmp) = loaded.font.rasterize(c, loaded.px);
+        };
+        let (m, bmp) = face.font.rasterize(c, face.px);
         if m.width == 0 || m.height == 0 {
             continue;
         }
@@ -179,8 +275,8 @@ fn draw_symbol(
             }
             let bx = (i % m.width) as i32;
             let by = (i / m.width) as i32;
-            // Faux italic: shear top rows right (documented approximation).
-            let shear = if italic {
+            // Faux italic: shear top rows right (fallback only).
+            let shear = if faux_italic {
                 ((m.height as i32 - 1 - by) as f32 * 0.15) as i32
             } else {
                 0
@@ -189,12 +285,32 @@ fn draw_symbol(
             let dy = top + by;
             if dx >= 0 && dy >= 0 {
                 blend(dst, dx as u32, dy as u32, fg, cov);
-                // Faux bold: double-strike one pixel right.
-                if bold {
-                    blend(dst, (dx + 1) as u32, dy as u32, fg, cov);
+                // Faux bold: double-strike one unscaled pixel right.
+                if faux_bold {
+                    blend(dst, (dx + u) as u32, dy as u32, fg, cov);
                 }
             }
         }
+    }
+    if uncovered.is_empty() {
+        return;
+    }
+    draw_tofu(
+        dst,
+        pen_x,
+        cell_top + 2 * u,
+        span_px,
+        cell_h.saturating_sub(4 * u as u32),
+        fg,
+        u,
+    );
+    if let Some((missing, x, y)) = missing {
+        missing.push(MissingGlyph {
+            x,
+            y,
+            symbol: symbol.to_string(),
+            codepoints: uncovered.iter().map(|c| format!("U+{:04X}", *c as u32)).collect(),
+        });
     }
 }
 
@@ -202,18 +318,38 @@ fn draw_symbol(
 pub fn render_png(
     frame: &Frame,
     profile: &Profile,
-    font_bytes: &[u8],
+    faces: &FontFaces<'_>,
 ) -> Result<Vec<u8>, RenderError> {
+    Ok(render_png_report(frame, profile, faces)?.png)
+}
+
+/// Render plus exact coverage accounting (see [`Fidelity`]).
+pub fn render_png_report(
+    frame: &Frame,
+    profile: &Profile,
+    faces: &FontFaces<'_>,
+) -> Result<Rendered, RenderError> {
     frame
         .validate()
         .map_err(|e| RenderError(format!("refusing to render: {e}")))?;
-    let loaded = load_font(font_bytes, profile.font_px)?;
-    verify_geometry(&loaded, profile)?;
+    // Geometry pins are UNSCALED metrics; the gate compares against the
+    // profile constants directly.
+    let unscaled = load_font(faces.regular, profile.font_px)?;
+    verify_geometry(&unscaled, profile)?;
 
-    let w1 = frame.cols as u32 * profile.cell_w + profile.pad * 2;
-    let h1 = frame.rows as u32 * profile.cell_h + profile.pad * 2;
+    // HiDPI: rasterize glyphs at the final scale, no post upscale.
+    let u = profile.scale;
+    let set = FontSet::load(faces, profile.font_px * u as f32)?;
+    let cell_w = profile.cell_w * u;
+    let cell_h = profile.cell_h * u;
+    let pad = profile.pad * u;
+    let u_i = u as i32;
+
+    let w = frame.cols as u32 * cell_w + pad * 2;
+    let h = frame.rows as u32 * cell_h + pad * 2;
     let bg = profile.default_bg;
-    let mut img = image::RgbImage::from_pixel(w1, h1, image::Rgb([bg.r, bg.g, bg.b]));
+    let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([bg.r, bg.g, bg.b]));
+    let mut missing: Vec<MissingGlyph> = Vec::new();
 
     for y in 0..frame.rows {
         for x in 0..frame.cols {
@@ -224,42 +360,46 @@ pub fn render_png(
                 continue;
             }
             let (fg, cbg) = Frame::resolve_cell(cell, profile.default_fg, profile.default_bg);
-            let span = u32::from(cell.width.max(1)) * profile.cell_w;
-            let cx = profile.pad + x as u32 * profile.cell_w;
-            let cy = profile.pad + y as u32 * profile.cell_h;
+            let span = u32::from(cell.width.max(1)) * cell_w;
+            let cx = pad + x as u32 * cell_w;
+            let cy = pad + y as u32 * cell_h;
             if cbg != profile.default_bg {
-                fill_rect(&mut img, cx, cy, span, profile.cell_h, cbg);
+                fill_rect(&mut img, cx, cy, span, cell_h, cbg);
             }
             if cell.mods.hidden || cell.symbol.trim().is_empty() {
                 continue;
             }
-            let baseline = cy as i32 + loaded.ascent.round() as i32;
+            let baseline = cy as i32 + set.regular.ascent.round() as i32;
             draw_symbol(
                 &mut img,
-                &loaded,
+                &set,
                 &cell.symbol,
                 cx as i32,
                 baseline,
                 span,
                 cy as i32,
-                profile.cell_h,
+                cell_h,
                 fg,
                 cell.mods.bold,
                 cell.mods.italic,
+                u_i,
+                Some((&mut missing, x, y)),
             );
             if cell.mods.underline {
-                let uy = (baseline + 2).min((cy + profile.cell_h - 1) as i32);
-                let th = if cell.mods.bold { 2 } else { 1 };
+                let uy = (baseline + 2 * u_i).min((cy + cell_h - 1) as i32);
+                let th = if cell.mods.bold { 2 * u } else { u };
                 for t in 0..th {
                     for dx in 0..span {
-                        blend(&mut img, cx + dx, (uy + t) as u32, fg, 255);
+                        blend(&mut img, cx + dx, (uy + t as i32) as u32, fg, 255);
                     }
                 }
             }
             if cell.mods.strikethrough {
-                let sy = baseline - (loaded.ascent * 0.35) as i32;
-                for dx in 0..span {
-                    blend(&mut img, cx + dx, sy.max(0) as u32, fg, 255);
+                let sy = baseline - (set.regular.ascent * 0.35) as i32;
+                for t in 0..u {
+                    for dx in 0..span {
+                        blend(&mut img, cx + dx, (sy + t as i32).max(0) as u32, fg, 255);
+                    }
                 }
             }
         }
@@ -276,54 +416,65 @@ pub fn render_png(
         }
         if let Some(cell) = frame.get(cx, frame.cursor.y) {
             let (fg, cbg) = Frame::resolve_cell(cell, profile.default_fg, profile.default_bg);
-            let span = u32::from(cell.width.max(1)) * profile.cell_w;
-            let px = profile.pad + cx as u32 * profile.cell_w;
-            let py = profile.pad + frame.cursor.y as u32 * profile.cell_h;
+            let span = u32::from(cell.width.max(1)) * cell_w;
+            let px = pad + cx as u32 * cell_w;
+            let py = pad + frame.cursor.y as u32 * cell_h;
             let style = frame.cursor.style;
             match style {
                 crate::frame::CursorStyle::Block => {
-                    fill_rect(&mut img, px, py, span, profile.cell_h, fg);
+                    fill_rect(&mut img, px, py, span, cell_h, fg);
                     if !cell.mods.hidden && !cell.symbol.trim().is_empty() {
-                        let baseline = py as i32 + loaded.ascent.round() as i32;
+                        let baseline = py as i32 + set.regular.ascent.round() as i32;
                         draw_symbol(
                             &mut img,
-                            &loaded,
+                            &set,
                             &cell.symbol,
                             px as i32,
                             baseline,
                             span,
                             py as i32,
-                            profile.cell_h,
+                            cell_h,
                             cbg,
                             false,
                             false,
+                            u_i,
+                            None,
                         );
                     }
                 }
                 crate::frame::CursorStyle::Underline => {
-                    let uy = (py + profile.cell_h - 2) as i32;
-                    for dx in 0..span {
-                        blend(&mut img, px + dx, uy as u32, fg, 255);
-                        blend(&mut img, px + dx, (uy + 1) as u32, fg, 255);
+                    let uy = (py + cell_h - 2 * u) as i32;
+                    for t in 0..2 * u {
+                        for dx in 0..span {
+                            blend(&mut img, px + dx, (uy + t as i32) as u32, fg, 255);
+                        }
                     }
                 }
                 crate::frame::CursorStyle::Bar => {
-                    for dy in 0..profile.cell_h {
-                        blend(&mut img, px, py + dy, fg, 255);
-                        blend(&mut img, px + 1, py + dy, fg, 255);
+                    for dx in 0..2 * u {
+                        for dy in 0..cell_h {
+                            blend(&mut img, px + dx, py + dy, fg, 255);
+                        }
                     }
                 }
             }
         }
     }
 
-    let (w, h) = (w1 * profile.scale, h1 * profile.scale);
-    let big = image::imageops::resize(&img, w, h, image::imageops::FilterType::Nearest);
     let mut out = Vec::new();
-    image::DynamicImage::ImageRgb8(big)
+    image::DynamicImage::ImageRgb8(img)
         .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .map_err(|e| RenderError(format!("PNG encode: {e}")))?;
-    Ok(out)
+    let fidelity = Fidelity {
+        profile: profile.name.clone(),
+        font_sha256: profile.font_sha256.clone(),
+        font_desc: profile.font_desc.clone(),
+        scale: u,
+        approximate: !missing.is_empty() || !set.fell_back.is_empty(),
+        faces_fell_back: set.fell_back.iter().map(|s| s.to_string()).collect(),
+        missing,
+    };
+    Ok(Rendered { png: out, fidelity })
 }
 
 fn esc_xml(s: &str) -> String {
@@ -342,7 +493,7 @@ pub fn render_svg(frame: &Frame, profile: &Profile) -> String {
     let h = frame.rows as u32 * ch + pad * 2;
     let bg = profile.default_bg.to_hex();
     let mut s = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" font-family=\"'DejaVuSansM Nerd Font Mono','DejaVu Sans Mono',monospace\" font-size=\"{}\">\n<rect width=\"100%\" height=\"100%\" fill=\"{bg}\"/>\n",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" font-family=\"'JetBrainsMono Nerd Font Mono','JetBrains Mono',monospace\" font-size=\"{}\">\n<rect width=\"100%\" height=\"100%\" fill=\"{bg}\"/>\n",
         profile.font_px as u32
     );
     for y in 0..frame.rows {

@@ -3,7 +3,7 @@
 //! Layout under a store root:
 //! ```text
 //! approved/<name>.frame.json   approved/<name>.png
-//! actual/<name>.frame.json     actual/<name>.png
+//! actual/<name>.frame.json     actual/<name>.png (+ .png.fidelity.json)
 //! diff/<name>.png              report.html
 //! ```
 //!
@@ -273,6 +273,11 @@ impl Store {
         self.root.join("actual").join(format!("{name}.png"))
     }
 
+    /// Missing-glyph sidecar next to a PNG (`<name>.png.fidelity.json`).
+    fn fidelity_sidecar(png: &Path) -> PathBuf {
+        png.with_extension("png.fidelity.json")
+    }
+
     fn diff_png(&self, name: &str) -> PathBuf {
         self.root.join("diff").join(format!("{name}.png"))
     }
@@ -299,7 +304,9 @@ impl Store {
     }
 
     /// Check one actual frame against approval. Writes actual artifacts
-    /// BEFORE comparing; on mismatch also writes the diff PNG.
+    /// BEFORE comparing; on mismatch also writes the diff PNG. The actual
+    /// PNG is paired with a `<name>.png.fidelity.json` sidecar listing any
+    /// glyphs the font chain did not cover (never silent tofu).
     ///
     /// `pixel_threshold`: strict gates pass 1.0; review passes lower it
     /// explicitly. Dimensions must match exactly either way.
@@ -308,16 +315,21 @@ impl Store {
         name: &str,
         actual: &Frame,
         profile: &Profile,
-        font_bytes: &[u8],
+        faces: &crate::profile::FontFaces<'_>,
         pixel_threshold: f64,
     ) -> Result<CompareOutcome, SnapshotError> {
         actual.validate().map_err(SnapshotError::from)?;
-        let actual_png_bytes =
-            render::render_png(actual, profile, font_bytes).map_err(SnapshotError::from)?;
+        let rendered =
+            render::render_png_report(actual, profile, faces).map_err(SnapshotError::from)?;
+        let actual_png_bytes = &rendered.png;
         let actual_frame_path = self.actual_frame(name);
         let actual_png_path = self.actual_png(name);
         write_atomic(&actual_frame_path, actual.to_json().as_bytes())?;
-        write_atomic(&actual_png_path, &actual_png_bytes)?;
+        write_atomic(&actual_png_path, actual_png_bytes)?;
+        write_atomic(
+            &Self::fidelity_sidecar(&actual_png_path),
+            rendered.fidelity.to_json().as_bytes(),
+        )?;
 
         let approved_frame_path = self.approved_frame(name);
         let approved_png_path = self.approved_png(name);
@@ -414,9 +426,9 @@ impl Store {
         let approved_png_bytes = match std::fs::read(&approved_png_path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let rendered = render::render_png(&approved, profile, font_bytes)?;
+                let rendered = render::render_png_report(&approved, profile, faces)?;
                 outcome.approved_png_regenerated = true;
-                rendered
+                rendered.png
             }
             Err(e) => {
                 return Err(SnapshotError(format!(
@@ -476,6 +488,14 @@ impl Store {
             } else {
                 write_atomic(&dst, &bytes)?;
             }
+        }
+        // Pair the missing-glyph sidecar when the check produced one.
+        let (src, dst) = (
+            Self::fidelity_sidecar(&self.actual_png(name)),
+            Self::fidelity_sidecar(&self.approved_png(name)),
+        );
+        if let Ok(bytes) = std::fs::read(&src) {
+            write_atomic(&dst, &bytes)?;
         }
         Ok(())
     }

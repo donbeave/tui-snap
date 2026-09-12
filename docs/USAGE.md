@@ -55,11 +55,12 @@ when a test panics.
 ## The gate
 
 ```rust
-let outcome = store.check("home", &frame, &profile, VENDORED_FONT, 1.0)?;
+let outcome = store.check("home", &frame, &profile, &VENDORED_FACES, 1.0)?;
 outcome.ensure_matched()?;
 ```
 
-1. `actual/` artifacts are written FIRST (`<name>.frame.json` + `.png`).
+1. `actual/` artifacts are written FIRST (`<name>.frame.json` + `.png` +
+   `.png.fidelity.json` missing-glyph sidecar).
 2. Missing approval → `MissingApproval` (fail-closed: "new snapshot
    requires review"). Corrupt approval → `CorruptApproval` naming the file.
 3. Cell comparison is exact (symbol, width, colors, all modifiers, cursor).

@@ -91,7 +91,7 @@ python3 tools/test_migration.py
 ```text
 <store>/approved/<name>.frame.json   # the only committed artifact (compact JSON)
 <store>/actual/<name>.frame.json     # local evidence (gitignored)
-<store>/actual/<name>.png
+<store>/actual/<name>.png            # + <name>.png.fidelity.json (missing glyphs)
 <store>/diff/<name>.png              # red-overlay diff, on mismatch
 <store>/report.html                  # portable: embedded PNGs + frame JSON
 ```
@@ -101,15 +101,21 @@ Approved PNGs regenerate deterministically and are not committed.
 ## Fidelity contract
 
 - Layout from frame widths (CJK keeps 2 cells even as tofu); real glyphs via
-  `fontdue` from a pinned vendored font — never placeholder blocks.
-- Profile pins font bytes (SHA-256), 10×19 cells at 16px, palette, scale ×2,
-  cursor policy. `verify_geometry` fails loudly on drift.
+  `fontdue` from a pinned vendored font — never placeholder blocks. Glyphs
+  rasterize at the final scale (`font_px × scale`), HiDPI-crisp with no
+  post upscale.
+- Profile pins font bytes (SHA-256), 10×21 cells at 16px (JetBrains Mono
+  metrics), palette, scale ×2, cursor policy. `verify_geometry` fails loudly
+  on drift.
+- Bold / italic / bold-italic render with the REAL faces of the vendored
+  JetBrainsMono Nerd Font Mono family; the faux double-strike / shear survive
+  only when a face fails to load or `--font-file` overrides with one face.
 - Covered: box drawing, blocks, Braille, Nerd icons, combining marks.
-  CJK/emoji without font coverage render as deterministic tofu with correct
-  advance (documented in `assets/fonts/FONTS.md`).
+  CJK/emoji/⚷ (U+26B7) without font coverage render as deterministic tofu
+  with correct advance AND are reported in `<name>.png.fidelity.json` next to
+  every PNG output (documented in `assets/fonts/FONTS.md`).
 - Terminal-like, measured fidelity — NOT pixel-identity with any terminal
-  emulator. Faux-bold (double-strike) and faux-italic (shear) are documented
-  approximations; cell data stays authoritative for styles.
+  emulator; cell data stays authoritative for styles.
 
 ## Docs
 

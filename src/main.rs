@@ -108,24 +108,67 @@ enum Cmd {
     },
 }
 
-fn load_font_bytes(path: Option<&PathBuf>) -> Result<(Vec<u8>, tuisnap::Profile)> {
+fn load_font_bytes(path: Option<&PathBuf>) -> Result<(OwnedFaces, tuisnap::Profile)> {
     let profile = tuisnap::Profile::default_profile();
     match path {
-        None => Ok((tuisnap::VENDORED_FONT.to_vec(), profile)),
+        None => Ok((
+            OwnedFaces {
+                regular: tuisnap::VENDORED_FONT.to_vec(),
+                bold: tuisnap::VENDORED_FONT_BOLD.to_vec(),
+                italic: tuisnap::VENDORED_FONT_ITALIC.to_vec(),
+                bold_italic: tuisnap::VENDORED_FONT_BOLD_ITALIC.to_vec(),
+            },
+            profile,
+        )),
         Some(p) => {
             let bytes = std::fs::read(p).with_context(|| format!("read font {}", p.display()))?;
             let profile = profile.with_font_file(format!("{}", p.display()), &bytes);
-            Ok((bytes, profile))
+            // Single-face override: faux bold/italic, as documented.
+            Ok((
+                OwnedFaces {
+                    regular: bytes.clone(),
+                    bold: bytes.clone(),
+                    italic: bytes.clone(),
+                    bold_italic: bytes,
+                },
+                profile,
+            ))
         }
     }
+}
+
+/// Owned face bytes so `--font-file` overrides can outlive their read.
+struct OwnedFaces {
+    regular: Vec<u8>,
+    bold: Vec<u8>,
+    italic: Vec<u8>,
+    bold_italic: Vec<u8>,
+}
+
+impl OwnedFaces {
+    fn faces(&self) -> tuisnap::FontFaces<'_> {
+        tuisnap::FontFaces {
+            regular: &self.regular,
+            bold: &self.bold,
+            italic: &self.italic,
+            bold_italic: &self.bold_italic,
+        }
+    }
+}
+
+fn esc_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn render_formats(
     frame: &tuisnap::Frame,
     profile: &tuisnap::Profile,
-    font_bytes: &[u8],
+    faces: &tuisnap::FontFaces<'_>,
     formats: &[String],
     out: &str,
+    name: &str,
 ) -> Result<()> {
     if formats.is_empty() {
         anyhow::bail!("no --format given");
@@ -143,20 +186,38 @@ fn render_formats(
             "json" => std::fs::write(&path, frame.to_json())?,
             "svg" => std::fs::write(&path, tuisnap::render::render_svg(frame, profile))?,
             "html" => {
-                // Standalone view: authoritative PNG embedded + frame JSON.
-                let png = tuisnap::render::render_png(frame, profile, font_bytes)
+                // Standalone view: selectable SVG as the primary visual, the
+                // authoritative PNG kept under <details>, frame JSON embedded
+                // for lossless re-import.
+                let rendered = tuisnap::render::render_png_report(frame, profile, faces)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png);
+                let b64 =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &rendered.png);
+                let (png_w, _) = profile.image_size(frame.cols, frame.rows);
+                let svg = tuisnap::render::render_svg(frame, profile).replacen(
+                    "<svg ",
+                    &format!("<svg style=\"width:{png_w}px;height:auto\" "),
+                    1,
+                );
                 let html = format!(
-                    "<!doctype html><html><head><meta charset=\"utf-8\"><title>tuisnap</title></head><body style=\"background:#141414\"><img src=\"data:image/png;base64,{b64}\" alt=\"frame\"><script type=\"application/json\">{}</script></body></html>",
+                    "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{background:#141414;margin:24px}}svg{{display:block}}details{{color:#ccc;margin-top:12px}}img{{max-width:100%}}</style></head><body>{svg}<details><summary>authoritative PNG (pixel-gate evidence)</summary><img src=\"data:image/png;base64,{b64}\" alt=\"frame\"></details><script type=\"application/json\">{}</script></body></html>",
+                    esc_html(name),
                     tuisnap::snapshot::json_for_script(&frame.to_json())
                 );
                 std::fs::write(&path, html)?;
             }
             "png" => {
-                let png = tuisnap::render::render_png(frame, profile, font_bytes)
+                let rendered = tuisnap::render::render_png_report(frame, profile, faces)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                std::fs::write(&path, png)?;
+                std::fs::write(&path, &rendered.png)?;
+                let sidecar = format!("{path}.fidelity.json");
+                std::fs::write(&sidecar, rendered.fidelity.to_json())?;
+                if rendered.fidelity.approximate {
+                    eprintln!(
+                        "note: {} uncovered glyph(s) (see {sidecar})",
+                        rendered.fidelity.missing.len()
+                    );
+                }
             }
             _ => anyhow::bail!("unknown format: {f} (txt|ansi|json|svg|html|png)"),
         }
@@ -211,11 +272,17 @@ fn main() -> Result<()> {
             out,
             font_file,
         } => {
-            let (font_bytes, profile) = load_font_bytes(font_file.as_ref())?;
+            let (owned, profile) = load_font_bytes(font_file.as_ref())?;
             let text = std::fs::read_to_string(&input)
                 .with_context(|| format!("read {}", input.display()))?;
             let frame = tuisnap::Frame::from_json(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
-            render_formats(&frame, &profile, &font_bytes, &formats, &out)?;
+            // Frame name for the HTML <title>: input stem minus `.frame`.
+            let name = input
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.strip_suffix(".frame").unwrap_or(s))
+                .unwrap_or("frame");
+            render_formats(&frame, &profile, &owned.faces(), &formats, &out, name)?;
             println!("{}", frame.text());
         }
         Cmd::Check {
@@ -225,12 +292,12 @@ fn main() -> Result<()> {
             pixel_threshold,
             font_file,
         } => {
-            let (font_bytes, profile) = load_font_bytes(font_file.as_ref())?;
+            let (owned, profile) = load_font_bytes(font_file.as_ref())?;
             let text = std::fs::read_to_string(&input)
                 .with_context(|| format!("read {}", input.display()))?;
             let frame = tuisnap::Frame::from_json(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
             let st = tuisnap::snapshot::Store::new(&store);
-            let outcome = st.check(&name, &frame, &profile, &font_bytes, pixel_threshold)?;
+            let outcome = st.check(&name, &frame, &profile, &owned.faces(), pixel_threshold)?;
             let entry = report_entry(&st, &outcome, &profile)?;
             let report = tuisnap::snapshot::write_report(&st, "tuisnap visual report", &[entry])?;
             eprintln!("report: {}", report.display());
@@ -259,7 +326,7 @@ fn main() -> Result<()> {
             pixel_threshold,
             font_file,
         } => {
-            let (font_bytes, profile) = load_font_bytes(font_file.as_ref())?;
+            let (owned, profile) = load_font_bytes(font_file.as_ref())?;
             let st = tuisnap::snapshot::Store::new(&store);
             let mut entries = Vec::new();
             let mut failed = 0u32;
@@ -272,7 +339,8 @@ fn main() -> Result<()> {
                     .and_then(|s| s.strip_suffix(".frame"))
                     .unwrap_or("?")
                     .to_string();
-                let outcome = st.check(&name, &frame, &profile, &font_bytes, pixel_threshold)?;
+                let outcome =
+                    st.check(&name, &frame, &profile, &owned.faces(), pixel_threshold)?;
                 if !outcome.status.matched() {
                     failed += 1;
                 }
@@ -315,9 +383,9 @@ fn main() -> Result<()> {
                 tuisnap::pty::run_once(&argv, &opts, &steps, Duration::from_millis(settle_ms))?;
             match (store, name) {
                 (Some(root), Some(n)) => {
-                    let (font_bytes, profile) = load_font_bytes(font_file.as_ref())?;
+                    let (owned, profile) = load_font_bytes(font_file.as_ref())?;
                     let st = tuisnap::snapshot::Store::new(&root);
-                    let outcome = st.check(&n, &frame, &profile, &font_bytes, pixel_threshold)?;
+                    let outcome = st.check(&n, &frame, &profile, &owned.faces(), pixel_threshold)?;
                     let entry = report_entry(&st, &outcome, &profile)?;
                     let report =
                         tuisnap::snapshot::write_report(&st, "tuisnap visual report", &[entry])?;
@@ -328,8 +396,14 @@ fn main() -> Result<()> {
                     println!("matched: {n}");
                 }
                 _ => {
-                    let (font_bytes, profile) = load_font_bytes(None)?;
-                    render_formats(&frame, &profile, &font_bytes, &formats, &out)?;
+                    let (owned, profile) = load_font_bytes(None)?;
+                    // Frame name for the HTML <title>: the --out basename.
+                    let name = std::path::Path::new(&out)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("frame");
+                    let name = name.to_string();
+                    render_formats(&frame, &profile, &owned.faces(), &formats, &out, &name)?;
                     println!("{}", frame.text());
                 }
             }

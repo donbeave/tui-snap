@@ -1,5 +1,5 @@
 //! Independent ANSI and buffer sentinels; expected values are not snapshots.
-use tuisnap::{Cell, Color, Frame, Profile, Provenance, Rgb, VENDORED_FONT};
+use tuisnap::{Cell, Color, Frame, Profile, Provenance, Rgb, VENDORED_FACES};
 fn prov() -> Provenance {
     Provenance::now("qualification", "fixture", vec![])
 }
@@ -69,8 +69,8 @@ fn hidden_and_blink_are_canonical_and_hidden_does_not_paint() {
     assert_ne!(blank.digest(), hidden.digest());
     let profile = Profile::default_profile();
     assert_eq!(
-        tuisnap::render::render_png(&hidden, &profile, VENDORED_FONT).unwrap(),
-        tuisnap::render::render_png(&blank, &profile, VENDORED_FONT).unwrap()
+        tuisnap::render::render_png(&hidden, &profile, &VENDORED_FACES).unwrap(),
+        tuisnap::render::render_png(&blank, &profile, &VENDORED_FACES).unwrap()
     );
     assert!(!tuisnap::render::render_svg(&hidden, &profile).contains('H'));
 }

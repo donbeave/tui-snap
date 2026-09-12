@@ -10,7 +10,7 @@ mod fixture_app;
 use fixture_app::{render_model, Model, Screen};
 use std::path::PathBuf;
 use tuisnap::snapshot::Store;
-use tuisnap::{Profile, Provenance, VENDORED_FONT};
+use tuisnap::{Profile, Provenance, VENDORED_FACES};
 
 fn store() -> Store {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/visual");
@@ -44,7 +44,7 @@ fn fixture_visual_gates() {
                 let frame =
                     tuisnap::ratatui::draw_frame(cols, rows, prov(), |f| render_model(f, &model));
                 let outcome = st
-                    .check(&name, &frame, &profile, VENDORED_FONT, 1.0)
+                    .check(&name, &frame, &profile, &VENDORED_FACES, 1.0)
                     .unwrap();
                 outcomes.push((name, outcome));
             }

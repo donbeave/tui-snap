@@ -4,7 +4,7 @@
 use ratatui::widgets::Paragraph;
 use std::path::PathBuf;
 use tuisnap::snapshot::{Status, Store};
-use tuisnap::{Profile, Provenance, VENDORED_FONT};
+use tuisnap::{Profile, Provenance, VENDORED_FACES};
 
 fn prov() -> Provenance {
     Provenance {
@@ -36,7 +36,7 @@ fn missing_approval_fails_closed_but_writes_actuals() {
     let (_dir, st) = tmp_store("missing");
     let frame = frame_with("hello");
     let outcome = st
-        .check("home", &frame, &profile(), VENDORED_FONT, 1.0)
+        .check("home", &frame, &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     assert_eq!(outcome.status, Status::MissingApproval);
     // Actuals on disk BEFORE any assertion ran.
@@ -50,12 +50,12 @@ fn accept_then_match_round_trip() {
     let (_dir, st) = tmp_store("accept");
     let frame = frame_with("stable screen");
     let o1 = st
-        .check("home", &frame, &profile(), VENDORED_FONT, 1.0)
+        .check("home", &frame, &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     assert!(!o1.status.matched());
     st.accept("home").unwrap();
     let o2 = st
-        .check("home", &frame, &profile(), VENDORED_FONT, 1.0)
+        .check("home", &frame, &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     assert_eq!(o2.status, Status::Matched);
     assert_eq!(o2.pixel_score, Some(1.0));
@@ -69,7 +69,7 @@ fn changed_snapshot_reports_cells_and_diff_image() {
         "home",
         &frame_with("before"),
         &profile(),
-        VENDORED_FONT,
+        &VENDORED_FACES,
         1.0,
     )
     .unwrap();
@@ -79,7 +79,7 @@ fn changed_snapshot_reports_cells_and_diff_image() {
             "home",
             &frame_with("after!"),
             &profile(),
-            VENDORED_FONT,
+            &VENDORED_FACES,
             1.0,
         )
         .unwrap();
@@ -91,6 +91,26 @@ fn changed_snapshot_reports_cells_and_diff_image() {
     assert!(diff.exists());
     let err = outcome.ensure_matched().unwrap_err().to_string();
     assert!(err.contains("actual:") && err.contains("diff:") && err.contains("tuisnap accept"));
+}
+
+#[test]
+fn check_writes_fidelity_sidecar_next_to_actual_png() {
+    let (_dir, st) = tmp_store("fidelity");
+    let frame = frame_with("crab 🦀");
+    let outcome = st
+        .check("home", &frame, &profile(), &VENDORED_FACES, 1.0)
+        .unwrap();
+    let sidecar = outcome.actual_png.with_extension("png.fidelity.json");
+    let json = std::fs::read_to_string(&sidecar).unwrap();
+    assert!(json.contains("\"approximate\": true"), "{json}");
+    assert!(json.contains("U+1F980"), "{json}");
+    // Acceptance pairs the sidecar with the approved PNG.
+    st.accept("home").unwrap();
+    let approved = st
+        .root()
+        .join("approved")
+        .join("home.png.fidelity.json");
+    assert!(std::fs::read_to_string(&approved).unwrap().contains("U+1F980"));
 }
 
 #[test]
@@ -106,7 +126,7 @@ fn corrupt_approval_is_explicit() {
     )
     .unwrap();
     let outcome = st
-        .check("home", &frame_with("x"), &profile(), VENDORED_FONT, 1.0)
+        .check("home", &frame_with("x"), &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     assert_eq!(outcome.status, Status::CorruptApproval);
     let err = outcome.ensure_matched().unwrap_err().to_string();
@@ -121,7 +141,7 @@ fn no_env_var_can_auto_accept() {
     std::env::set_var("UPDATE_SNAPSHOT", "1");
     let (_dir, st) = tmp_store("noauto");
     let outcome = st
-        .check("home", &frame_with("x"), &profile(), VENDORED_FONT, 1.0)
+        .check("home", &frame_with("x"), &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     std::env::remove_var("BLESS");
     std::env::remove_var("TUISNAP_ACCEPT");
@@ -141,12 +161,12 @@ fn concurrent_different_names_are_safe() {
                 let name = format!("screen-{t}");
                 let frame = frame_with(&format!("thread {t}"));
                 let o = st
-                    .check(&name, &frame, &profile(), VENDORED_FONT, 1.0)
+                    .check(&name, &frame, &profile(), &VENDORED_FACES, 1.0)
                     .unwrap();
                 assert_eq!(o.status, Status::MissingApproval);
                 st.accept(&name).unwrap();
                 let o2 = st
-                    .check(&name, &frame, &profile(), VENDORED_FONT, 1.0)
+                    .check(&name, &frame, &profile(), &VENDORED_FACES, 1.0)
                     .unwrap();
                 assert!(o2.status.matched());
             });
@@ -161,7 +181,7 @@ fn report_embeds_images_and_frame_json() {
     let (_dir, st) = tmp_store("report");
     let frame = frame_with("reported");
     let outcome = st
-        .check("home", &frame, &profile(), VENDORED_FONT, 1.0)
+        .check("home", &frame, &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     let actual_png = std::fs::read(&outcome.actual_png).unwrap();
     let actual_json = std::fs::read_to_string(&outcome.actual_frame).unwrap();
@@ -192,14 +212,14 @@ fn report_embeds_images_and_frame_json() {
 #[test]
 fn corrupt_approved_png_is_an_explicit_error() {
     let (_dir, st) = tmp_store("badpng");
-    st.check("home", &frame_with("x"), &profile(), VENDORED_FONT, 1.0)
+    st.check("home", &frame_with("x"), &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     st.accept("home").unwrap();
     // Sabotage the approved PNG (frame JSON stays valid).
     let root = st.root();
     std::fs::write(root.join("approved").join("home.png"), b"not a png").unwrap();
     let err = st
-        .check("home", &frame_with("x"), &profile(), VENDORED_FONT, 1.0)
+        .check("home", &frame_with("x"), &profile(), &VENDORED_FACES, 1.0)
         .unwrap_err()
         .to_string();
     assert!(err.contains("cannot decode expected PNG"), "{err}");
@@ -208,12 +228,12 @@ fn corrupt_approved_png_is_an_explicit_error() {
 #[test]
 fn dimension_mismatch_status() {
     let (_dir, st) = tmp_store("dims");
-    st.check("home", &frame_with("x"), &profile(), VENDORED_FONT, 1.0)
+    st.check("home", &frame_with("x"), &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     st.accept("home").unwrap();
     let other = tuisnap::ratatui::widget_frame(Paragraph::new("x"), 20, 5, prov());
     let outcome = st
-        .check("home", &other, &profile(), VENDORED_FONT, 1.0)
+        .check("home", &other, &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     assert_eq!(outcome.status, Status::DimensionMismatch);
 }
@@ -222,12 +242,12 @@ fn dimension_mismatch_status() {
 fn relaxed_threshold_still_gates_dimensions() {
     let (_dir, st) = tmp_store("threshold");
     let frame = frame_with("same");
-    st.check("home", &frame, &profile(), VENDORED_FONT, 1.0)
+    st.check("home", &frame, &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     st.accept("home").unwrap();
     // Identical frames score 1.0: matched under any threshold <= 1.0.
     let outcome = st
-        .check("home", &frame, &profile(), VENDORED_FONT, 0.99)
+        .check("home", &frame, &profile(), &VENDORED_FACES, 0.99)
         .unwrap();
     assert!(outcome.status.matched());
     assert_eq!(outcome.pixel_score, Some(1.0));
@@ -245,7 +265,7 @@ fn same_name_concurrent_checks_are_safe() {
             s.spawn(move || {
                 let st = Store::new(&root);
                 let o = st
-                    .check("home", &frame, &profile(), VENDORED_FONT, 1.0)
+                    .check("home", &frame, &profile(), &VENDORED_FACES, 1.0)
                     .unwrap();
                 assert!(matches!(
                     o.status,
@@ -259,7 +279,7 @@ fn same_name_concurrent_checks_are_safe() {
     let st = Store::new(&root);
     st.accept("home").unwrap();
     let o = st
-        .check("home", &frame, &profile(), VENDORED_FONT, 1.0)
+        .check("home", &frame, &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     assert!(o.status.matched());
     // Approved frame still parses (no torn writes).
@@ -276,7 +296,7 @@ fn script_embed_round_trips_hostile_symbols() {
     // must restore it losslessly.
     frame.cells[0].symbol = "<".to_string();
     let outcome = st
-        .check("home", &frame, &profile(), VENDORED_FONT, 1.0)
+        .check("home", &frame, &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     let entry = tuisnap::snapshot::ReportEntry {
         outcome,

@@ -5,7 +5,7 @@
 //! themes and sizes, geometry-pin failure, SVG/ANSI outputs.
 
 use ratatui::widgets::Paragraph;
-use tuisnap::{Profile, Provenance, VENDORED_FONT};
+use tuisnap::{Profile, Provenance, VENDORED_FACES, VENDORED_FONT};
 
 fn prov() -> Provenance {
     Provenance {
@@ -24,7 +24,7 @@ fn profile() -> Profile {
 
 fn widget_png(text: &str, cols: u16, rows: u16) -> Vec<u8> {
     let frame = tuisnap::ratatui::widget_frame(Paragraph::new(text), cols, rows, prov());
-    tuisnap::render::render_png(&frame, &profile(), VENDORED_FONT).unwrap()
+    tuisnap::render::render_png(&frame, &profile(), &VENDORED_FACES).unwrap()
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn cjk_keeps_two_cell_geometry() {
     let cont = frame.get(1, 0).unwrap();
     assert!(cont.continuation && cont.width == 0);
     // Renders without error regardless of font coverage (tofu fallback).
-    let png = tuisnap::render::render_png(&frame, &profile(), VENDORED_FONT).unwrap();
+    let png = tuisnap::render::render_png(&frame, &profile(), &VENDORED_FACES).unwrap();
     assert!(!png.is_empty());
 }
 
@@ -90,7 +90,7 @@ fn geometry_pin_fails_loudly() {
     let frame = tuisnap::ratatui::widget_frame(Paragraph::new("x"), 10, 3, prov());
     let mut bad = profile();
     bad.cell_w = 11;
-    let err = tuisnap::render::render_png(&frame, &bad, VENDORED_FONT).unwrap_err();
+    let err = tuisnap::render::render_png(&frame, &bad, &VENDORED_FACES).unwrap_err();
     assert!(err.to_string().contains("geometry pin broken"), "{err}");
 }
 
@@ -108,10 +108,86 @@ fn svg_and_ansi_outputs_carry_content() {
 fn font_hash_pinned_and_documented() {
     let p = profile();
     assert_eq!(p.font_sha256.len(), 64);
+    // JetBrainsMonoNerdFontMono-Regular.ttf (SIL OFL 1.1, see FONTS.md).
     assert_eq!(
         p.font_sha256,
-        "9b55ade625f2d3f2a273ed16d9db2d924ad6236222920f9fd1324941cdc3c712"
+        "f2a5ea6cfab397445ffab00c0370927b66d61e560a05db5db271b42006381c1a"
     );
+}
+
+#[test]
+fn bold_and_italic_use_real_faces_not_faux() {
+    use tuisnap::Mods;
+    let bold = Mods {
+        bold: true,
+        ..Default::default()
+    };
+    let italic = Mods {
+        italic: true,
+        ..Default::default()
+    };
+    let real = tuisnap::render::render_png(
+        &frame_with_mods("real", bold),
+        &profile(),
+        &VENDORED_FACES,
+    )
+    .unwrap();
+    // Single-face chain: bold falls back to the faux double-strike, which
+    // must differ from the real Bold face.
+    let faux = tuisnap::render::render_png(
+        &frame_with_mods("real", bold),
+        &profile(),
+        &tuisnap::FontFaces::single(VENDORED_FONT),
+    )
+    .unwrap();
+    assert_ne!(real, faux, "real Bold face must differ from faux bold");
+    let real_it = tuisnap::render::render_png(
+        &frame_with_mods("real", italic),
+        &profile(),
+        &VENDORED_FACES,
+    )
+    .unwrap();
+    let faux_it = tuisnap::render::render_png(
+        &frame_with_mods("real", italic),
+        &profile(),
+        &tuisnap::FontFaces::single(VENDORED_FONT),
+    )
+    .unwrap();
+    assert_ne!(real_it, faux_it, "real Italic face must differ from faux");
+}
+
+#[test]
+fn fidelity_reports_missing_glyphs_exactly() {
+    // 🦀 (U+1F980) is not covered by the vendored family (see FONTS.md).
+    let frame = tuisnap::ratatui::widget_frame(Paragraph::new("ok 🦀"), 20, 5, prov());
+    let r = tuisnap::render::render_png_report(&frame, &profile(), &VENDORED_FACES).unwrap();
+    assert!(r.fidelity.approximate, "uncovered glyph must mark approximate");
+    assert_eq!(r.fidelity.missing.len(), 1);
+    let m = &r.fidelity.missing[0];
+    assert_eq!(m.symbol, "🦀");
+    assert_eq!(m.codepoints, vec!["U+1F980".to_string()]);
+    assert_eq!((m.x, m.y), (3, 0));
+    assert!(r.fidelity.to_json().contains("U+1F980"));
+    // Fully covered text: exact, nothing missing.
+    let frame = tuisnap::ratatui::widget_frame(Paragraph::new("plain ╔═╗ ⠋"), 20, 5, prov());
+    let r = tuisnap::render::render_png_report(&frame, &profile(), &VENDORED_FACES).unwrap();
+    assert!(!r.fidelity.approximate);
+    assert!(r.fidelity.missing.is_empty());
+    assert!(r.fidelity.faces_fell_back.is_empty());
+}
+
+#[test]
+fn broken_styled_face_falls_back_and_is_recorded() {
+    let faces = tuisnap::FontFaces {
+        regular: VENDORED_FONT,
+        bold: b"not a font",
+        italic: VENDORED_FONT,
+        bold_italic: VENDORED_FONT,
+    };
+    let frame = tuisnap::ratatui::widget_frame(Paragraph::new("fallback"), 20, 5, prov());
+    let r = tuisnap::render::render_png_report(&frame, &profile(), &faces).unwrap();
+    assert_eq!(r.fidelity.faces_fell_back, vec!["bold".to_string()]);
+    assert!(r.fidelity.approximate);
 }
 
 fn frame_with_mods(symbol: &str, mods: tuisnap::Mods) -> tuisnap::Frame {
@@ -131,7 +207,7 @@ fn every_modifier_changes_pixels() {
     let plain = tuisnap::render::render_png(
         &frame_with_mods("x", Mods::default()),
         &profile(),
-        VENDORED_FONT,
+        &VENDORED_FACES,
     )
     .unwrap();
     for (label, mods) in [
@@ -179,7 +255,7 @@ fn every_modifier_changes_pixels() {
         ),
     ] {
         let styled =
-            tuisnap::render::render_png(&frame_with_mods("x", mods), &profile(), VENDORED_FONT)
+            tuisnap::render::render_png(&frame_with_mods("x", mods), &profile(), &VENDORED_FACES)
                 .unwrap();
         assert_ne!(plain, styled, "{label} must change pixels");
     }
@@ -193,8 +269,8 @@ fn dark_vs_light_theme_changes_pixels() {
         cell.bg = tuisnap::Color::Indexed(15);
         cell.fg = tuisnap::Color::Indexed(0);
     }
-    let a = tuisnap::render::render_png(&dark, &profile(), VENDORED_FONT).unwrap();
-    let b = tuisnap::render::render_png(&light, &profile(), VENDORED_FONT).unwrap();
+    let a = tuisnap::render::render_png(&dark, &profile(), &VENDORED_FACES).unwrap();
+    let b = tuisnap::render::render_png(&light, &profile(), &VENDORED_FACES).unwrap();
     assert_ne!(a, b);
     let _ = &mut dark;
 }
@@ -207,7 +283,7 @@ fn emoji_tofu_keeps_two_cell_advance() {
     assert_eq!(lead.width, 2, "emoji lead must be width 2 (glyph or tofu)");
     assert!(frame.get(1, 0).unwrap().continuation);
     // Renders either way: real glyph if covered, deterministic tofu if not.
-    let png = tuisnap::render::render_png(&frame, &profile(), VENDORED_FONT).unwrap();
+    let png = tuisnap::render::render_png(&frame, &profile(), &VENDORED_FACES).unwrap();
     assert!(!png.is_empty());
 }
 
@@ -216,7 +292,7 @@ fn cursor_styles_render() {
     use tuisnap::{Cursor, CursorStyle};
     let mut hidden = tuisnap::ratatui::widget_frame(Paragraph::new("cur"), 20, 5, prov());
     hidden.cursor.visible = false;
-    let base = tuisnap::render::render_png(&hidden, &profile(), VENDORED_FONT).unwrap();
+    let base = tuisnap::render::render_png(&hidden, &profile(), &VENDORED_FACES).unwrap();
     for style in [CursorStyle::Block, CursorStyle::Underline, CursorStyle::Bar] {
         let mut f = hidden.clone();
         f.cursor = Cursor {
@@ -226,7 +302,7 @@ fn cursor_styles_render() {
             style,
             blinking: false,
         };
-        let png = tuisnap::render::render_png(&f, &profile(), VENDORED_FONT).unwrap();
+        let png = tuisnap::render::render_png(&f, &profile(), &VENDORED_FACES).unwrap();
         assert_ne!(base, png, "{style:?} cursor must change pixels");
     }
 }
