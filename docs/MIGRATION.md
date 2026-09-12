@@ -22,11 +22,11 @@ Schema v3 is unchanged: blink stays frozen-visible with slow/rapid combined,
 hidden is conceal, overline/underline-styles stay dropped. MSRV is now 1.97
 (termpane floor) — a breaking change for consumers.
 
-The PTY engine and raw-ANSI replay now run on `termpane` v0.7.0 (pinned git
+The PTY engine and raw-ANSI replay now run on `termpane` v0.1.0 (pinned git
 tag via termlens) instead of the vendored vt100 0.16.2 fork. Attr mapping:
 hidden=conceal, blink=slow||rapid, all others 1:1; colors Default/Idx/Rgb 1:1;
 DECAWM, bell events, `?12`, serialization round-trips, DEC 2026 and DECRQM
-coverage per termpane CHANGELOG 0.7.0. The pending-wrap phantom column
+coverage per termpane CHANGELOG 0.1.0. The pending-wrap phantom column
 (`cursor_position` == cols) is clamped to `cols-1` in `ansi::replay_raw`,
 matching the prior fork behavior; `validate()` still rejects out-of-grid
 cursors loudly. The `termlens` shadow parser is deleted (attributes are native

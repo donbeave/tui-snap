@@ -68,7 +68,7 @@ version = "0.1"
 
 [dependencies.termpane]
 git = "https://github.com/tailrocks/termpane"
-tag = "v0.7.0"
+tag = "v0.1.0"
 
 [dev-dependencies.anyhow]
 version = "1"
