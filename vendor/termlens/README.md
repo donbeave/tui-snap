@@ -74,7 +74,7 @@ flowchart TB
     subgraph tt["termlens"]
       api["Terminal<br/>send · click · drag · paste · focus · signal · resize · wait_until / wait_frame / wait_idle / wait_exit"]
       reader["reader thread<br/>drains continuously — output is never lost between waits"]
-      emu["VT emulator<br/>vt100 behind a small internal trait, swappable"]
+      emu["VT emulator<br/>termpane behind a small internal trait, swappable"]
       screen["Screen<br/>immutable grid snapshots · cells · cursor · styles · modes · repaints · bells · images"]
     end
   end
@@ -308,7 +308,7 @@ design. termlens's position:
   unaffected; for run-and-exit programs, end the script with a `read` and
   release it after asserting — see the "instant-exit caveat" in
   [docs/DESIGN.md](docs/DESIGN.md).
-- Exotic grapheme clusters render as the vt100 crate renders them; the
+- Exotic grapheme clusters render as termpane renders them; the
   unicode-torture fixture pins the current behavior.
 
 ## MSRV

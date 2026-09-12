@@ -13,14 +13,14 @@
 //!    are parsed incrementally in O(1) space, and `?2026` is recognized
 //!    anywhere in a multi-mode list such as `CSI ? 2026 ; 25 h`.
 //!
-//! It also tracks screen state the vt100 backend does not expose: the
+//! It also tracks out-of-band screen state alongside the grid: the
 //! **window title** (`OSC 0`/`OSC 2`), kept whole in its own buffer — the
 //! diagnostic capture below truncates at 24 bytes, real titles don't fit —
 //! focus reporting (mode 1004), the cursor shape (`DECSCUSR`), and the
-//! **set of mouse tracking modes** the application asked for, which vt100
+//! **set of mouse tracking modes** the application asked for, which the grid
 //! collapses into the one protocol it would report in.
 //!
-//! And it holds the **character-set state** vt100 ignores: which glyph set
+//! And it holds the **character-set state** the grid ignores: which glyph set
 //! `ESC ( ) * + Ps` designated into G0–G3, which of G0/G1 `SI`/`SO` has
 //! lock-shifted, and whether `ESC N` (SS2) / `ESC O` (SS3) has invoked G2/G3
 //! for the next character only. That is what lets the emulator hand the grid
@@ -37,7 +37,7 @@
 //! (`SO`/`SI`); `LS2`/`LS3` are not modelled. The tracker decides, the
 //! emulator rewrites: the bytes the
 //! parsers see are then a translated stream rather than a sub-slice of the
-//! read, which `emu/vt100.rs` stages.
+//! read, which `emu/termpane.rs` stages.
 
 use std::sync::Arc;
 
@@ -418,11 +418,11 @@ pub(crate) struct SeqTracker {
     /// which is the other half of "did this repaint get more expensive?".
     frame_printable: u32,
     /// True while the application has focus reporting (mode 1004) enabled.
-    /// Tracked here because vt100 does not model 1004 at all — the same
-    /// reason the window title is tracked here.
+    /// Tracked here alongside the window title so snapshots and `DECRQM`
+    /// answers read out-of-band state from one place.
     focus_events: bool,
     /// The mouse tracking modes the application has enabled and not yet
-    /// disabled, as [`mouse_bit`]s. vt100 collapses the four into the one
+    /// disabled, as [`mouse_bit`]s. The grid collapses the four into the one
     /// protocol it would report in — correct for the input path, since a
     /// terminal reports in one protocol — which cannot say which members
     /// of the group were asked for; crossterm asks for three at once. The
@@ -454,8 +454,8 @@ pub(crate) struct SeqTracker {
     single_shift: Option<SingleShift>,
     /// The charset half of the state `DECSC` (`ESC 7`) saves: G0–G3 and
     /// which of G0/G1 is locked in. `DECRC` (`ESC 8`) restores it; with
-    /// nothing saved it restores the power-on defaults, as xterm does. vt100
-    /// saves and restores the cursor and attributes itself, so only the
+    /// nothing saved it restores the power-on defaults, as xterm does. The
+    /// grid saves and restores the cursor and attributes itself, so only the
     /// half it does not know about lives here. `None` after RIS, or a
     /// restore after a reset would resurrect a designation from before it.
     saved_charsets: Option<SavedCharsets>,
@@ -638,7 +638,7 @@ impl SeqTracker {
     }
 
     /// The mouse tracking modes the application has enabled and not yet
-    /// disabled — the requested set, not the one protocol vt100 reports in.
+    /// disabled — the requested set, not the one protocol the grid reports in.
     pub(crate) fn mouse_tracking(&self) -> MouseModes {
         MouseModes::from_bits(self.mouse_tracking)
     }
@@ -863,8 +863,8 @@ impl SeqTracker {
         }
 
         // DECSCUSR (`CSI Ps SP q`): the shape of the cursor, and whether it
-        // blinks. vt100 models neither, so a modal editor switching to a bar
-        // for insert mode is invisible without this — as is the program that
+        // blinks. Tracked here so a modal editor switching to a bar
+        // for insert mode is visible — as is the program that
         // switches and never switches back, which leaves the user's terminal
         // wrong after exit.
         //
@@ -890,8 +890,8 @@ impl SeqTracker {
             return SeqEvent::None;
         }
 
-        // DEC private mode 1004 (focus reporting). vt100 does not model it,
-        // so an application that enables it is invisible without this — and
+        // DEC private mode 1004 (focus reporting). Tracked here so an
+        // application that enables it is visible — and
         // `focus_in`/`focus_out` refuse to send events the application never
         // asked for, exactly as `click` refuses without mouse tracking.
         if self.csi_prefix == b'?' && self.csi_saw_1004 {
@@ -1005,7 +1005,7 @@ impl SeqTracker {
                 }
                 content => {
                     // OSC 0 (icon + title) / OSC 2 (title) set the window
-                    // title — state the vt100 backend does not track.
+                    // title — out-of-band state tracked here.
                     // OSC 1 (icon only) is deliberately ignored.
                     if let Some(title) = content
                         .strip_prefix(b"0;")
@@ -1258,7 +1258,7 @@ impl SeqTracker {
                     if b == BEL && self.utf8_remaining == 0 {
                         self.bells = self.bells.saturating_add(1);
                     }
-                    // Locking shifts: SO invokes G1, SI returns to G0. vt100
+                    // Locking shifts: SO invokes G1, SI returns to G0. The grid
                     // sees both bytes too and ignores them, so nothing else
                     // has to be told. A pending single shift overrides
                     // whichever is locked, for one character, and is not
@@ -1366,7 +1366,7 @@ impl SeqTracker {
                 // DECSC / DECRC: the charset half of save-cursor and
                 // restore-cursor. The idiom is save, jump, draw a border,
                 // restore — and a restore that forgot the designation
-                // rendered the border after it as `lqk`. vt100 does the
+                // rendered the border after it as `lqk`. The grid does the
                 // cursor and attributes; the sets are ours (#232).
                 b'7' => {
                     self.saved_charsets = Some(SavedCharsets {
@@ -2134,7 +2134,7 @@ mod tests {
         assert_eq!(drawn(b"\x1b(0\x1b(0"), "");
     }
 
-    /// The vt100-terminfo shape: designate into G1 once, then SO/SI.
+    /// The terminfo shape: designate into G1 once, then SO/SI.
     #[test]
     fn shift_out_invokes_g1_and_shift_in_returns_to_g0() {
         assert_eq!(drawn(b"\x1b)0lqk"), "lqk", "G1 designated but not invoked");

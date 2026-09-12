@@ -2,19 +2,17 @@
 //!
 //! The public types ([`Screen`](crate::Screen) et al.) are termlens's own;
 //! the VT emulator sits behind this small internal trait so the backend can
-//! be swapped (e.g. for `wezterm-term` or `alacritty_terminal`) without any
-//! public API change. One backend ships today: the `vt100` crate, plus the
-//! attribute shadow in `shadow.rs` that recovers the three SGR attributes
-//! vt100 drops.
+//! be swapped without any public API change. One backend ships today:
+//! `termpane` — a deterministic VT-parsed cell grid with native attributes,
+//! scrollback, and replayable serialization.
 
 mod seq;
-mod shadow;
-mod vt100;
+mod termpane;
 
 #[cfg(feature = "decode")]
 pub(crate) use self::seq::decode_base64;
 pub(crate) use self::seq::Query;
-pub(crate) use self::vt100::Vt100Emulator;
+pub(crate) use self::termpane::TermpaneEmulator;
 
 use crate::screen::MouseMode;
 use crate::Screen;

@@ -45,13 +45,13 @@ pub struct Style {
     pub bg: Color,
     /// Bold / increased intensity (`SGR 1`).
     ///
-    /// `bold` and `dim` are two fields over **one** intensity state: the
-    /// last of `SGR 1` and `SGR 2` written wins, so a cell never reports
-    /// both, and `ESC[1;2m` reads as dim only. `SGR 22` clears whichever
-    /// is set.
+    /// `bold` and `dim` are independent flags: `ESC[1;2m` reports both, and
+    /// each has its own reset through the `22`-then-reassert sequence
+    /// (`22;1` keeps bold only, `22;2` keeps dim only). `SGR 22` alone clears
+    /// both.
     pub bold: bool,
-    /// Dim / decreased intensity (`SGR 2`). Shares one intensity state with
-    /// [`bold`](Self::bold): last write wins, never both.
+    /// Dim / decreased intensity (`SGR 2`). Independent from
+    /// [`bold`](Self::bold): both may be set at once.
     pub dim: bool,
     /// Italic.
     pub italic: bool,
@@ -1234,7 +1234,7 @@ impl Screen {
     ///
     /// Folding is **per cell**, not over the joined string, and that is the
     /// load-bearing detail: a cell holds a base character together with its
-    /// combining marks (vt100 appends them to the cell being written), so
+    /// combining marks (the grid appends them to the cell being written), so
     /// folding cell by cell composes exactly what the terminal draws in one
     /// cell and can never compose across a cell boundary. It also keeps the
     /// byte-to-column map exact, which is what [`find`](Self::find) reports.
@@ -1458,7 +1458,7 @@ mod tests {
             if let Some(line) = lines.get(r) {
                 for ch in line.chars() {
                     // A zero-width combining mark joins the cell it modifies,
-                    // which is what vt100 does: it appends combining
+                    // which is what the grid does: it appends combining
                     // characters to the cell currently being written rather
                     // than advancing. Modelling that here matters, because
                     // needle folding is per cell.
