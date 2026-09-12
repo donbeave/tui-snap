@@ -4,8 +4,7 @@
 //! a Latin-1 file name vanished from the grid and every column to its right
 //! shifted left (#217) — a terminal shows a replacement character there and
 //! keeps the columns where they are. Decoding happens here, once, on the
-//! reader thread, so both parsers (the primary and the attribute shadow)
-//! see the same valid stream.
+//! reader thread, so the single termpane parser sees a valid stream.
 //!
 //! A multi-byte character can be split across two reads; the incomplete tail
 //! is carried over rather than replaced, and only becomes U+FFFD when the

@@ -8,3 +8,4 @@ tests/visual/actual/
 tests/visual/diff/
 tests/visual/report.html
 tests/visual/approved/*.png
+vendor/termlens/Cargo.lock

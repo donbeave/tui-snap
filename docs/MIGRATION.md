@@ -56,6 +56,55 @@ cursor is a limitation, not equivalence to the PTY path. Use PTY captures for
 cursor shape/blinking assertions. Raster output remains a pinned approximation
 of terminal font rendering, not pixel identity with a terminal emulator.
 
+## Differential evidence (vt100 oracle, pre-cutover)
+
+Oracle: temporary feature-gated harness fed deleted `Vt100Emulator` vs
+`TermpaneEmulator` identical bytes at rows=4, cols=10, scrollback=100 via
+`feed_all` helper looping `process` across frame/query stops. Removed with
+oracle at cutover; results preserved here because oracle no longer exists
+in-tree.
+
+Compared 16 streams:
+- combined-attr wide SGR+RGB: `b"\x1b[1;2;7;8;5;9mX\x1b[0m\x1b[2;1H\x1b[38;2;1;2;3;48;2;4;5;6m\xe7\x95\x8c"`
+- autowrap-off overwrite+reenable: `b"\x1b[?7l\x1b[1;8HABC\x1b[?7hDE\x1b[3;1H"`
+- autowrap-off wide suppression: `b"\x1b[?7l\x1b[2;8H\xe7\x95\x8c\x1b[3;1H"`
+- `?7l+A`: `b"\x1b[?7l\x1b[1;8HA"`
+- `?7h+A`: `b"\x1b[?7h\x1b[1;8HA"`
+- intensity 1;2/22: `b"\x1b[1;2mX\x1b[22;1mB\x1b[22;2mD\x1b[0mN"`
+- blink/conceal/strike separate cells: `b"\x1b[5mB\x1b[0m\x1b[8mC\x1b[0m\x1b[9mS\x1b[0mp"`
+- 256-color vs truecolor: `b"\x1b[38;5;196mX\x1b[0m\x1b[38;2;0;8;9mY"`
+- colon-form RGB: `b"\x1b[38:2:10:20:30mA\x1b[0m\x1b[38:2::10:20:30mB"`
+- DEC Special Graphics box: `b"\x1b(0lqqqk\x1b(B"`
+- 7-line scrollback: `b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven"`
+- alt-screen enter/exit: `b"\x1b[?1049hALT\x1b[?1049lBACK"`
+- mode-set 2004/1/1002: `b"\x1b[?2004h\x1b[?1h\x1b[?1002h"`
+- 2026 frame: `b"\x1b[?2026hframe1\x1b[?2026lnext"`
+- U+FFFD replacement: `b"caf\xef\xbf\xbd done"`
+- bold/color/blink mix: `b"\x1b[1;31mA\x1b[0m\x1b[5mB\x1b[0m\x1b[1;5;4mC"`
+
+Compared per stream: text, styled text, cursor, size, mouse mode,
+bracketed paste, app cursor, alt screen, scrollback text, `mid_sequence`,
+`in_sync_update`, `mode_state` for 1/7/25/47/1049/2004/1004/1000/1002/
+1003/1005/1006/2026; plus split-half re-feed agreement (feed `n/2`, then
+rest, compare to one-shot).
+
+Outcome: zero diffs one-shot on all 16; zero diffs split-half on 15/16.
+Exception: U+FFFD split inside its 3-byte sequence — old `STAND_IN` hack
+(`stand_in_for_replacement`/`restore_replacement` in deleted
+`vendor/termlens/src/emu/vt100.rs`) needed all 3 bytes in one feed and
+dropped it; termpane buffers incomplete UTF-8 across calls via `pending_utf8`
++ ground-state tracker in termpane crate (`src/grid.rs` `process` +
+`src/grid/midseq.rs`), surfaced as `DamageGrid::mid_sequence()` and
+OR-composed by `mid_sequence()` in `vendor/termlens/src/emu/termpane.rs`,
+and draws it; history-text path (`capture_scrolled_rows`/`row_text`) agrees.
+Judged vt100 limitation, termpane correct, not bent to match.
+
+Re-verify today without oracle: ported pins in `tests/tool_qualification.rs`
+(`serialized_contents_restore_wrap_before_painting`,
+`formatted_intensity_roundtrip_clears_each_independent_flag`,
+`formatted_terminal_modes_preserve_autowrap_disable_and_restore`) plus PTY
+matrix in `tests/pty.rs`, all green on new engine.
+
 ---
 
 # Migration: v0.1 → v0.2

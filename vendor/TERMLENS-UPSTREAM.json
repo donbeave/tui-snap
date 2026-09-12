@@ -9,7 +9,9 @@
     "Cargo.toml: termpane git dependency (tag v0.7.0), removed vt100 dependency",
     "Cargo.toml: removed explicit example/test targets absent from library-only vendor copy",
     "src/emu: TermpaneEmulator backend over termpane 0.7 (native attrs, scrollback, modes); removed vt100 backend + shadow parser",
-    "src/screen.rs: bold/dim documented as independent flags (termpane parity)"
+    "src/screen.rs: bold/dim documented as independent flags (termpane parity)",
+    "src/emu: upstream vt100.rs backend and tui-snap shadow.rs removed at cutover (hashes above = removal baseline); replacement src/emu/termpane.rs has no upstream counterpart",
+    "file hashes = 0.9.0 vendor baseline, not post-swap content (mod.rs/seq.rs/screen.rs/terminal.rs/Cargo.toml changed after)"
   ],
   "files": {
     "Cargo.toml": "142041cb2f42669fa1886a9467404630cdae8009688c8ea308ea64576ee3bcb2",
