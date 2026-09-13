@@ -71,8 +71,8 @@ let outcome = store.check("home", &frame, &profile, &VENDORED_FACES, 1.0)?;
 outcome.ensure_matched()?;
 ```
 
-Bulk gates should reuse one renderer per thread instead of paying 5 font
-parses per check:
+Bulk gates should reuse one renderer per thread instead of paying 8 font
+parses (4 primary + 3 fallback + the geometry probe) per check:
 
 ```rust
 let mut renderer = profile.renderer(&VENDORED_FACES)?;  // faces parsed once

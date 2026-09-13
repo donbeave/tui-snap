@@ -59,7 +59,8 @@ fn cjk_keeps_two_cell_geometry() {
     assert_eq!(lead.width, 2, "CJK lead must be width 2");
     let cont = frame.get(1, 0).unwrap();
     assert!(cont.continuation && cont.width == 0);
-    // Renders without error regardless of font coverage (tofu fallback).
+    // Renders without error regardless of font coverage: 日本 is served by
+    // the vendored CJK fallback face; uncovered codepoints would draw tofu.
     let png = tuisnap::render::render_png(&frame, &profile(), &VENDORED_FACES).unwrap();
     assert!(!png.is_empty());
 }
@@ -168,12 +169,13 @@ fn fidelity_reports_missing_glyphs_exactly() {
     assert_eq!(m.codepoints, vec!["U+1F980".to_string()]);
     assert_eq!((m.x, m.y), (3, 0));
     assert!(r.fidelity.to_json().contains("U+1F980"));
-    // Fully covered text: exact, nothing missing.
+    // Fully covered text: exact, nothing missing, no fallback faces engaged.
     let frame = tuisnap::ratatui::widget_frame(Paragraph::new("plain ╔═╗ ⠋"), 20, 5, prov());
     let r = tuisnap::render::render_png_report(&frame, &profile(), &VENDORED_FACES).unwrap();
     assert!(!r.fidelity.approximate);
     assert!(r.fidelity.missing.is_empty());
     assert!(r.fidelity.faces_fell_back.is_empty());
+    assert!(r.fidelity.fallback_glyphs.is_empty());
 }
 
 #[test]
@@ -406,5 +408,232 @@ fn cursor_styles_render() {
         };
         let png = tuisnap::render::render_png(&f, &profile(), &VENDORED_FACES).unwrap();
         assert_ne!(base, png, "{style:?} cursor must change pixels");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-glyph fallback chain (vendored Noto subsets): coverage, geometry pins,
+// determinism, and the zero-drift contract for primary-covered frames.
+// ---------------------------------------------------------------------------
+
+/// Ink strictly inside cell `(x, y=0)` excluding the margin the deterministic
+/// tofu box's outline occupies: tofu scores 0, a real glyph scores plenty.
+fn interior_ink(png: &[u8], x: u16, span_cells: u32) -> usize {
+    let img = image::load_from_memory(png).unwrap().to_rgb8();
+    let bg = image::Rgb([0u8, 0, 0]);
+    let (cw, ch, pad, u) = (10u32, 21u32, 12u32, 2u32);
+    let pen = (pad + x as u32 * cw) * u;
+    let top = pad * u;
+    let (span, height) = (span_cells * cw * u, ch * u);
+    let mut n = 0;
+    for dy in 5..(height - 6) {
+        for dx in 3..(span - 4) {
+            if img.get_pixel(pen + dx, top + dy) != &bg {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn fallback_faces_render_the_previously_missing_set() {
+    // The exact codepoints the consumer audit found rasterizing as tofu:
+    // 東 京 ☕ ⚷ ◐ ★ (U+6771 U+4EAC U+2615 U+26B7 U+25D0 U+2605).
+    let frame = tuisnap::ratatui::widget_frame(Paragraph::new("東京 ☕ ⚷ ◐ ★"), 30, 4, prov());
+    let r = tuisnap::render::render_png_report(&frame, &profile(), &VENDORED_FACES).unwrap();
+    assert!(r.fidelity.missing.is_empty(), "missing: {:?}", r.fidelity.missing);
+    assert!(!r.fidelity.approximate, "fully served by real faces: not approximate");
+    let served: Vec<String> = r
+        .fidelity
+        .fallback_glyphs
+        .iter()
+        .flat_map(|g| g.codepoints.clone())
+        .collect();
+    for cp in ["U+6771", "U+4EAC", "U+2615", "U+26B7", "U+25D0", "U+2605"] {
+        assert!(served.contains(&cp.to_string()), "{cp} not fallback-served: {served:?}");
+    }
+    let json = r.fidelity.to_json();
+    assert!(json.contains("fallback_glyphs"), "{json}");
+    assert!(json.contains("NotoSansSymbols2 subset"), "{json}");
+    assert!(json.contains("NotoSansSymbols subset"), "{json}");
+    assert!(json.contains("NotoSansCJKjp subset"), "{json}");
+    // Non-tofu pixels: every glyph cell has interior ink (tofu has none).
+    // Widths follow the frame model: 東 京 ☕ are wide (2 cells), ⚷ ◐ ★ narrow.
+    for (x, span, label) in [
+        (0u16, 2u32, "東"),
+        (2, 2, "京"),
+        (5, 2, "☕"),
+        (8, 1, "⚷"),
+        (10, 1, "◐"),
+        (12, 1, "★"),
+    ] {
+        assert!(
+            interior_ink(&r.png, x, span) > 20,
+            "{label} at cell {x} rendered as tofu or blank"
+        );
+    }
+    // Without the fallback chain the same frame is tofu + missing records,
+    // and the pixels differ.
+    let mut bare =
+        tuisnap::render::Renderer::with_fallbacks(&profile(), &VENDORED_FACES, &[]).unwrap();
+    let tofu = bare.render(&frame).unwrap();
+    assert_eq!(tofu.fidelity.missing.len(), 6);
+    assert!(tofu.fidelity.approximate);
+    assert!(tofu.fidelity.fallback_glyphs.is_empty());
+    assert_ne!(tofu.png, r.png);
+    for (x, span) in [(0u16, 2u32), (2, 2), (5, 2), (8, 1), (10, 1), (12, 1)] {
+        assert_eq!(interior_ink(&tofu.png, x, span), 0, "cell {x} must be hollow tofu");
+    }
+}
+
+#[test]
+fn fallback_render_is_byte_deterministic() {
+    let render = || {
+        let frame = tuisnap::ratatui::widget_frame(Paragraph::new("東京 ☕ ⚷ ◐ ★ ❤ ●"), 30, 4, prov());
+        tuisnap::render::render_png(&frame, &profile(), &VENDORED_FACES).unwrap()
+    };
+    assert_eq!(render(), render(), "same frame, fresh renderers: same bytes");
+    let mut r = tuisnap::render::Renderer::new(&profile(), &VENDORED_FACES).unwrap();
+    let frame = tuisnap::ratatui::widget_frame(Paragraph::new("東京 ☕ ⚷ ◐ ★ ❤ ●"), 30, 4, prov());
+    let a = r.render(&frame).unwrap().png;
+    let b = r.render(&frame).unwrap().png;
+    assert_eq!(a, b, "warm cache: same bytes");
+}
+
+#[test]
+fn vendored_fallback_hashes_pinned_and_documented() {
+    use tuisnap::profile::font_sha256;
+    // Subsets built by tools/subset_fonts.py from commit-pinned Noto
+    // upstreams (SIL OFL 1.1, assets/fonts/LICENSE-Noto.txt, FONTS.md).
+    assert_eq!(
+        font_sha256(tuisnap::VENDORED_SYMBOLS2_FONT),
+        "e1d177a40af910100eceb0e825331e55f0cfd005bc0f26087fd4e58fbe60e6c5"
+    );
+    assert_eq!(
+        font_sha256(tuisnap::VENDORED_SYMBOLS_FONT),
+        "6f9cc93e71f8676361c5db286368be046e75d42c0b841afbf3f50da6bb0a2b8a"
+    );
+    assert_eq!(
+        font_sha256(tuisnap::VENDORED_CJK_FONT),
+        "777bee41f0c6076c00ad919384359a6e396b8822cf9056041fca8fcf2759d897"
+    );
+    // The exported pins match the bytes (Renderer::new verifies at load).
+    assert_eq!(
+        tuisnap::VENDORED_SYMBOLS2_FONT_SHA256,
+        font_sha256(tuisnap::VENDORED_SYMBOLS2_FONT)
+    );
+    assert_eq!(
+        tuisnap::VENDORED_SYMBOLS_FONT_SHA256,
+        font_sha256(tuisnap::VENDORED_SYMBOLS_FONT)
+    );
+    assert_eq!(
+        tuisnap::VENDORED_CJK_FONT_SHA256,
+        font_sha256(tuisnap::VENDORED_CJK_FONT)
+    );
+    assert_eq!(tuisnap::VENDORED_FALLBACK_FACES.len(), 3);
+}
+
+#[test]
+fn fallback_hash_mismatch_refuses_to_render() {
+    let bad = tuisnap::FallbackFace {
+        bytes: tuisnap::VENDORED_CJK_FONT,
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        desc: "swapped bytes",
+    };
+    let err = tuisnap::render::Renderer::with_fallbacks(&profile(), &VENDORED_FACES, &[bad])
+        .err()
+        .expect("a hash mismatch must fail at construction");
+    assert!(err.to_string().contains("sha256 mismatch"), "{err}");
+}
+
+#[test]
+fn unparsable_fallback_face_fails_loudly() {
+    let bytes: &[u8] = b"definitely not a font";
+    let sha = tuisnap::profile::font_sha256(bytes);
+    let bad = tuisnap::FallbackFace {
+        bytes,
+        sha256: &sha,
+        desc: "junk",
+    };
+    let err = tuisnap::render::Renderer::with_fallbacks(&profile(), &VENDORED_FACES, &[bad])
+        .err()
+        .expect("an unparsable fallback face must fail at construction");
+    assert!(err.to_string().contains("fallback face 'junk'"), "{err}");
+}
+
+#[test]
+fn consumer_registered_fallback_face_serves_glyphs() {
+    // DejaVuSansMNerdFontMono (vendored for reference) covers U+25D0 ◐, the
+    // primary family does not: a consumer-registered chain serves it.
+    static DEJAVU: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMNerdFontMono-Regular.ttf");
+    let sha = tuisnap::profile::font_sha256(DEJAVU);
+    let face = tuisnap::FallbackFace {
+        bytes: DEJAVU,
+        sha256: &sha,
+        desc: "test DejaVuSansM Nerd Font Mono",
+    };
+    let mut r =
+        tuisnap::render::Renderer::with_fallbacks(&profile(), &VENDORED_FACES, &[face]).unwrap();
+    let frame = tuisnap::ratatui::widget_frame(Paragraph::new("◐"), 10, 3, prov());
+    let rendered = r.render(&frame).unwrap();
+    assert!(rendered.fidelity.missing.is_empty());
+    assert_eq!(rendered.fidelity.fallback_glyphs.len(), 1);
+    assert_eq!(
+        rendered.fidelity.fallback_glyphs[0].faces,
+        vec!["test DejaVuSansM Nerd Font Mono".to_string()]
+    );
+}
+
+#[test]
+fn primary_covered_frames_are_byte_identical_with_and_without_fallbacks() {
+    let frame =
+        tuisnap::ratatui::widget_frame(Paragraph::new("plain ╔═╗ ⠋ \u{f015} → ✓"), 30, 4, prov());
+    let mut with = tuisnap::render::Renderer::new(&profile(), &VENDORED_FACES).unwrap();
+    let mut without =
+        tuisnap::render::Renderer::with_fallbacks(&profile(), &VENDORED_FACES, &[]).unwrap();
+    let a = with.render(&frame).unwrap();
+    let b = without.render(&frame).unwrap();
+    assert_eq!(a.png, b.png, "fallback chain must not move primary-covered pixels");
+    assert_eq!(a.fidelity.to_json(), b.fidelity.to_json());
+    assert!(
+        !a.fidelity.to_json().contains("fallback_glyphs"),
+        "empty fallback record is omitted from the JSON"
+    );
+}
+
+#[test]
+fn primary_covered_fixtures_match_pre_fallback_render_bytes() {
+    // Baselines rendered by the pre-fallback renderer (rev 00b178e) from the
+    // approved fixture frames; every glyph in these frames is covered by the
+    // primary JetBrainsMono family, so the fallback chain must not move a
+    // single byte (zero-drift contract, constraint: PRIMARY GEOMETRY
+    // UNCHANGED).
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let baselines = root.join("tests/fixtures/render-baseline");
+    let approved = root.join("tests/visual/approved");
+    for name in [
+        "home-dark-80x24",
+        "home-light-160x50",
+        "table-dark-120x40",
+        "dialog-light-80x24",
+    ] {
+        let text = std::fs::read_to_string(approved.join(format!("{name}.frame.json"))).unwrap();
+        let frame = tuisnap::Frame::from_json(&text).unwrap();
+        let r = tuisnap::render::render_png_report(&frame, &profile(), &VENDORED_FACES).unwrap();
+        let baseline = std::fs::read(baselines.join(format!("{name}.png"))).unwrap();
+        assert_eq!(
+            r.png, baseline,
+            "{name}: primary-covered render drifted from the pre-fallback bytes"
+        );
+        assert!(r.fidelity.missing.is_empty(), "{name}: {:?}", r.fidelity.missing);
+        assert!(r.fidelity.fallback_glyphs.is_empty(), "{name}");
+        let baseline_fidelity =
+            std::fs::read_to_string(baselines.join(format!("{name}.png.fidelity.json"))).unwrap();
+        assert_eq!(
+            r.fidelity.to_json().trim(),
+            baseline_fidelity.trim(),
+            "{name}: fidelity sidecar drifted"
+        );
     }
 }

@@ -15,12 +15,17 @@
 //! - bold / italic / bold-italic use the REAL faces of the pinned family
 //!   (faux double-strike / shear survive only as fallback when a face fails
 //!   to load or the family is a single-face override);
+//! - per-glyph face chain: styled face → regular face → vendored fallback
+//!   faces ([`crate::profile::VENDORED_FALLBACK_FACES`], sha256-pinned Noto
+//!   subsets) → tofu; fallback glyphs are centered and clipped inside the
+//!   primary cell box and drawn in the fallback face's own weight;
 //! - underline / strikethrough drawn at fixed offsets from the baseline,
 //!   including across whitespace cells (as real terminals do);
 //! - blink frozen as visible; concealed glyphs omitted (see [`crate::frame`]);
 //! - glyphs no face in the chain covers draw a deterministic tofu box AND are
-//!   reported in the [`Fidelity`] record (the `.png.fidelity.json` sidecar) —
-//!   exact/missing reporting, never silent tofu.
+//!   reported in the [`Fidelity`] record (the `.png.fidelity.json` sidecar),
+//!   and glyphs served by a fallback face are recorded there too — exact
+//!   reporting, never silent tofu.
 
 use crate::frame::{Frame, Rgb};
 use crate::profile::{FontFaces, Profile};
@@ -47,6 +52,8 @@ pub struct LoadedFont {
     /// Pixels below baseline (nonnegative).
     pub descent: f32,
     pub px: f32,
+    /// Human-readable face identity (fallback faces: the pinned description).
+    pub desc: String,
 }
 
 /// Load + measure a font.
@@ -61,6 +68,7 @@ pub fn load_font(bytes: &[u8], px: f32) -> Result<LoadedFont, RenderError> {
         ascent: lm.ascent,
         descent: lm.descent.abs(),
         px,
+        desc: String::new(),
     })
 }
 
@@ -83,10 +91,13 @@ pub fn verify_geometry(loaded: &LoadedFont, profile: &Profile) -> Result<(), Ren
     Ok(())
 }
 
-/// The four faces of one family, loaded at one pixel size. Faces share the
-/// regular face's baseline (cell grid authority). A non-regular face that
-/// fails to parse falls back to the regular face and is named in
-/// `fell_back` (the faux styles then return for it).
+/// The four faces of one family, loaded at one pixel size, plus the per-glyph
+/// fallback chain. Faces share the regular face's baseline (cell grid
+/// authority). A non-regular face that fails to parse falls back to the
+/// regular face and is named in `fell_back` (the faux styles then return for
+/// it). Fallback faces are coverage-only: they serve single glyphs the
+/// primary family lacks, centered and clipped inside the primary cell box;
+/// they never move the cell grid.
 pub struct FontSet {
     pub regular: LoadedFont,
     pub bold: LoadedFont,
@@ -94,10 +105,24 @@ pub struct FontSet {
     pub bold_italic: LoadedFont,
     /// Non-regular faces that failed to parse and fell back to regular.
     pub fell_back: Vec<&'static str>,
+    /// Per-glyph fallback chain, tried in order after the primary family.
+    pub fallbacks: Vec<LoadedFont>,
 }
 
 impl FontSet {
     pub fn load(faces: &FontFaces<'_>, px: f32) -> Result<Self, RenderError> {
+        Self::load_with_fallbacks(faces, px, &[])
+    }
+
+    /// Load the styled family plus a pinned fallback chain. Each fallback
+    /// face's bytes are verified against its pinned SHA-256 before parsing;
+    /// a hash mismatch or an unparsable face fails the load (explicit, never
+    /// silent — a swapped/corrupt font must read as a renderer change).
+    pub fn load_with_fallbacks(
+        faces: &FontFaces<'_>,
+        px: f32,
+        fallbacks: &[crate::profile::FallbackFace<'_>],
+    ) -> Result<Self, RenderError> {
         let regular = load_font(faces.regular, px)?;
         let mut fell_back = Vec::new();
         let mut face = |bytes: &[u8], name: &'static str| match load_font(bytes, px) {
@@ -107,12 +132,33 @@ impl FontSet {
                 load_font(faces.regular, px).expect("regular face parsed above")
             }
         };
+        let mut loaded_fallbacks = Vec::with_capacity(fallbacks.len());
+        if fallbacks.len() > u8::MAX as usize {
+            return Err(RenderError(format!(
+                "fallback chain too long: {} faces (max 255)",
+                fallbacks.len()
+            )));
+        }
+        for f in fallbacks {
+            let actual = crate::profile::font_sha256(f.bytes);
+            if actual != f.sha256 {
+                return Err(RenderError(format!(
+                    "fallback face '{}' sha256 mismatch: pinned {}, got {actual} — refusing to render",
+                    f.desc, f.sha256
+                )));
+            }
+            let mut lf = load_font(f.bytes, px)
+                .map_err(|e| RenderError(format!("fallback face '{}': {e}", f.desc)))?;
+            lf.desc = f.desc.to_string();
+            loaded_fallbacks.push(lf);
+        }
         Ok(Self {
             bold: face(faces.bold, "bold"),
             italic: face(faces.italic, "italic"),
             bold_italic: face(faces.bold_italic, "bold_italic"),
             regular,
             fell_back,
+            fallbacks: loaded_fallbacks,
         })
     }
 
@@ -137,6 +183,19 @@ pub struct MissingGlyph {
     pub codepoints: Vec<String>,
 }
 
+/// One cell whose glyph(s) the primary family did not cover but a fallback
+/// face rendered as real ink (see [`Fidelity::fallback_glyphs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FallbackGlyph {
+    pub x: u16,
+    pub y: u16,
+    pub symbol: String,
+    /// Fallback-served codepoints, formatted `U+26B7`.
+    pub codepoints: Vec<String>,
+    /// Fallback face(s) that rendered them, in chain order.
+    pub faces: Vec<String>,
+}
+
 /// Exact coverage accounting for one rendered frame — written next to PNG
 /// outputs as `<name>.png.fidelity.json`. `approximate` is true when any
 /// glyph is missing or any styled face fell back (mirroring the legacy
@@ -151,6 +210,10 @@ pub struct Fidelity {
     /// Styled faces that failed to parse and fell back to regular.
     pub faces_fell_back: Vec<String>,
     pub missing: Vec<MissingGlyph>,
+    /// Cells a fallback face rendered (omitted from the JSON when empty, so
+    /// sidecars of primary-covered frames stay byte-stable).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fallback_glyphs: Vec<FallbackGlyph>,
 }
 
 impl Fidelity {
@@ -202,6 +265,8 @@ enum FaceIdx {
     Bold,
     Italic,
     BoldItalic,
+    /// Index into `FontSet::fallbacks` (chains are short: < 256 faces).
+    Fallback(u8),
 }
 
 fn face_idx(bold: bool, italic: bool) -> FaceIdx {
@@ -216,7 +281,7 @@ fn face_idx(bold: bool, italic: bool) -> FaceIdx {
 /// A reusable renderer: parses the pinned faces ONCE at construction (the
 /// geometry pin is verified there too) and caches glyph rasters across
 /// frames, so a bulk gate costs O(distinct glyphs) rasterizations instead of
-/// 5 font parses plus a full re-rasterization per frame.
+/// 8 font parses plus a full re-rasterization per frame.
 ///
 /// Threading: every method takes `&mut self`, so the borrow checker enforces
 /// exclusive use — give each parallel test thread its own instance
@@ -230,13 +295,34 @@ pub struct Renderer {
 
 impl Renderer {
     /// Load the faces and verify the geometry pin (once for all renders).
+    /// The per-glyph fallback chain is the vendored default
+    /// ([`crate::profile::VENDORED_FALLBACK_FACES`]); use
+    /// [`Self::with_fallbacks`] to replace it.
     pub fn new(profile: &Profile, faces: &FontFaces<'_>) -> Result<Self, RenderError> {
+        Self::with_fallbacks(profile, faces, crate::profile::VENDORED_FALLBACK_FACES)
+    }
+
+    /// Like [`Self::new`] but with an explicit per-glyph fallback chain,
+    /// tried in order after the primary family (pass `&[]` for
+    /// primary-family-only rendering). Each face's bytes are verified
+    /// against its pinned SHA-256 before parsing; a mismatch refuses to
+    /// render. Primary geometry stays pinned to `faces.regular` regardless —
+    /// fallback faces only fill coverage holes inside the pinned cell box.
+    pub fn with_fallbacks(
+        profile: &Profile,
+        faces: &FontFaces<'_>,
+        fallbacks: &[crate::profile::FallbackFace<'_>],
+    ) -> Result<Self, RenderError> {
         // Geometry pins are UNSCALED metrics; the gate compares against the
         // profile constants directly.
         let unscaled = load_font(faces.regular, profile.font_px)?;
         verify_geometry(&unscaled, profile)?;
         // HiDPI: rasterize glyphs at the final scale, no post upscale.
-        let set = FontSet::load(faces, profile.font_px * profile.scale as f32)?;
+        let set = FontSet::load_with_fallbacks(
+            faces,
+            profile.font_px * profile.scale as f32,
+            fallbacks,
+        )?;
         Ok(Self {
             profile: profile.clone(),
             set,
@@ -309,6 +395,7 @@ impl Renderer {
         let bg = profile.default_bg;
         let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([bg.r, bg.g, bg.b]));
         let mut missing: Vec<MissingGlyph> = Vec::new();
+        let mut fallback_glyphs: Vec<FallbackGlyph> = Vec::new();
 
         for y in 0..frame.rows {
             for x in 0..frame.cols {
@@ -348,7 +435,12 @@ impl Renderer {
                         cell.mods.bold,
                         cell.mods.italic,
                         u_i,
-                        Some((&mut missing, x, y)),
+                        Some(CellSinks {
+                            x,
+                            y,
+                            missing: &mut missing,
+                            fallback: &mut fallback_glyphs,
+                        }),
                     );
                 }
                 if cell.mods.underline {
@@ -440,6 +532,7 @@ impl Renderer {
             approximate: !missing.is_empty() || !self.set.fell_back.is_empty(),
             faces_fell_back: self.set.fell_back.iter().map(|s| s.to_string()).collect(),
             missing,
+            fallback_glyphs,
         };
         Ok(Rendered { png: out, fidelity })
     }
@@ -510,11 +603,23 @@ fn draw_tofu(dst: &mut image::RgbImage, x0: i32, top: i32, span_px: u32, h: u32,
     }
 }
 
+/// Per-cell fidelity sinks threaded through [`draw_symbol`] (the cursor
+/// redraw passes `None`: it re-renders a cell already accounted for).
+struct CellSinks<'a> {
+    x: u16,
+    y: u16,
+    missing: &'a mut Vec<MissingGlyph>,
+    fallback: &'a mut Vec<FallbackGlyph>,
+}
+
 /// Draw one lead-cell symbol at pen origin. Combining scalars overlay at the
 /// same origin (documented approximation of terminal combining behavior).
-/// Face chain: styled face → regular face → tofu (recorded in `missing`
-/// when `Some`). Faux styles apply only when the regular face serves a cell
-/// whose mods asked for a styled face. Rasters come from `cache` (per
+/// Face chain: styled face → regular face → fallback faces in chain order →
+/// tofu (recorded in `sinks.missing`). Faux styles apply only when the
+/// regular face serves a cell whose mods asked for a styled face. Fallback
+/// glyphs draw in their face's own weight, centered horizontally in the cell
+/// span and clipped to the cell rect (fallback faces have their own metrics;
+/// the primary cell grid never moves). Rasters come from `cache` (per
 /// `(char, face)`, negatives included) instead of re-rasterizing per cell.
 #[allow(clippy::too_many_arguments)]
 fn draw_symbol(
@@ -531,55 +636,103 @@ fn draw_symbol(
     bold: bool,
     italic: bool,
     u: i32,
-    missing: Option<(&mut Vec<MissingGlyph>, u16, u16)>,
+    mut sinks: Option<CellSinks<'_>>,
 ) {
     let styled = set.styled(bold, italic);
     let styled_idx = face_idx(bold, italic);
     let mut uncovered: Vec<char> = Vec::new();
+    let mut served: Vec<(char, u8)> = Vec::new();
     for c in symbol.chars() {
-        let (face, idx, faux_bold, faux_italic) = if styled.font.lookup_glyph_index(c) != 0 {
-            (styled, styled_idx, false, false)
+        // Face chain: styled → regular → fallbacks in order → missing.
+        enum Pick {
+            Styled,
+            Regular,
+            Fallback(usize),
+            Missing,
+        }
+        let pick = if styled.font.lookup_glyph_index(c) != 0 {
+            Pick::Styled
         } else if set.regular.font.lookup_glyph_index(c) != 0 {
-            (&set.regular, FaceIdx::Regular, bold, italic)
+            Pick::Regular
+        } else if let Some(fi) = set
+            .fallbacks
+            .iter()
+            .position(|f| f.font.lookup_glyph_index(c) != 0)
+        {
+            Pick::Fallback(fi)
         } else {
-            uncovered.push(c);
-            continue;
+            Pick::Missing
         };
-        let cached = cache.entry(GlyphKey { ch: c, face: idx }).or_insert_with(|| {
-            let (m, bmp) = face.font.rasterize(c, face.px);
-            if m.width == 0 || m.height == 0 {
-                None
-            } else {
-                Some((m, bmp))
+        match pick {
+            Pick::Styled => {
+                draw_primary(cache, dst, styled, styled_idx, c, pen_x, baseline, fg, false, false, u);
             }
-        });
-        let Some((m, bmp)) = cached else {
-            continue;
-        };
-        // ymin = offset of the bitmap's BOTTOM edge from the baseline, so the
-        // top edge sits at baseline - (ymin + height).
-        let top = baseline - (m.ymin + m.height as i32);
-        for (i, &cov) in bmp.iter().enumerate() {
-            if cov == 0 {
-                continue;
+            Pick::Regular => {
+                draw_primary(cache, dst, &set.regular, FaceIdx::Regular, c, pen_x, baseline, fg, bold, italic, u);
             }
-            let bx = (i % m.width) as i32;
-            let by = (i / m.width) as i32;
-            // Faux italic: shear top rows right (fallback only).
-            let shear = if faux_italic {
-                ((m.height as i32 - 1 - by) as f32 * 0.15) as i32
-            } else {
-                0
-            };
-            let dx = pen_x + m.xmin + bx + shear;
-            let dy = top + by;
-            if dx >= 0 && dy >= 0 {
-                blend(dst, dx as u32, dy as u32, fg, cov);
-                // Faux bold: double-strike one unscaled pixel right.
-                if faux_bold {
-                    blend(dst, (dx + u) as u32, dy as u32, fg, cov);
+            Pick::Missing => {
+                uncovered.push(c);
+            }
+            Pick::Fallback(fi) => {
+                let face = &set.fallbacks[fi];
+                let idx = FaceIdx::Fallback(fi as u8);
+                let cached = cache.entry(GlyphKey { ch: c, face: idx }).or_insert_with(|| {
+                    let (m, bmp) = face.font.rasterize(c, face.px);
+                    if m.width == 0 || m.height == 0 {
+                        None
+                    } else {
+                        Some((m, bmp))
+                    }
+                });
+                let Some((m, bmp)) = cached else {
+                    continue;
+                };
+                // Center the glyph's advance box in the cell span; clip ink
+                // to the cell rect so fallback metrics never bleed into
+                // neighboring cells.
+                let origin_x = pen_x + ((span_px as f32 - m.advance_width) / 2.0).round() as i32;
+                let top = baseline - (m.ymin + m.height as i32);
+                let mut inked = false;
+                for (i, &cov) in bmp.iter().enumerate() {
+                    if cov == 0 {
+                        continue;
+                    }
+                    let bx = (i % m.width) as i32;
+                    let by = (i / m.width) as i32;
+                    let dx = origin_x + m.xmin + bx;
+                    let dy = top + by;
+                    if dx < pen_x
+                        || dx >= pen_x + span_px as i32
+                        || dy < cell_top
+                        || dy >= cell_top + cell_h as i32
+                    {
+                        continue;
+                    }
+                    inked = true;
+                    blend(dst, dx as u32, dy as u32, fg, cov);
+                }
+                if inked {
+                    served.push((c, fi as u8));
                 }
             }
+        }
+    }
+    if !served.is_empty() {
+        if let Some(s) = sinks.as_mut() {
+            let mut faces: Vec<String> = Vec::new();
+            for (_, fi) in &served {
+                let desc = set.fallbacks[usize::from(*fi)].desc.clone();
+                if !faces.contains(&desc) {
+                    faces.push(desc);
+                }
+            }
+            s.fallback.push(FallbackGlyph {
+                x: s.x,
+                y: s.y,
+                symbol: symbol.to_string(),
+                codepoints: served.iter().map(|(c, _)| format!("U+{:04X}", *c as u32)).collect(),
+                faces,
+            });
         }
     }
     if uncovered.is_empty() {
@@ -594,19 +747,74 @@ fn draw_symbol(
         fg,
         u,
     );
-    if let Some((missing, x, y)) = missing {
-        missing.push(MissingGlyph {
-            x,
-            y,
+    if let Some(s) = sinks {
+        s.missing.push(MissingGlyph {
+            x: s.x,
+            y: s.y,
             symbol: symbol.to_string(),
             codepoints: uncovered.iter().map(|c| format!("U+{:04X}", *c as u32)).collect(),
         });
     }
 }
 
+/// Draw one glyph from the primary family (styled or regular face, with the
+/// faux double-strike / shear when the regular face serves a styled cell).
+/// This path is byte-stable: fallback-chain changes never touch it.
+#[allow(clippy::too_many_arguments)]
+fn draw_primary(
+    cache: &mut GlyphCache,
+    dst: &mut image::RgbImage,
+    face: &LoadedFont,
+    idx: FaceIdx,
+    c: char,
+    pen_x: i32,
+    baseline: i32,
+    fg: Rgb,
+    faux_bold: bool,
+    faux_italic: bool,
+    u: i32,
+) {
+    let cached = cache.entry(GlyphKey { ch: c, face: idx }).or_insert_with(|| {
+        let (m, bmp) = face.font.rasterize(c, face.px);
+        if m.width == 0 || m.height == 0 {
+            None
+        } else {
+            Some((m, bmp))
+        }
+    });
+    let Some((m, bmp)) = cached else {
+        return;
+    };
+    // ymin = offset of the bitmap's BOTTOM edge from the baseline, so the
+    // top edge sits at baseline - (ymin + height).
+    let top = baseline - (m.ymin + m.height as i32);
+    for (i, &cov) in bmp.iter().enumerate() {
+        if cov == 0 {
+            continue;
+        }
+        let bx = (i % m.width) as i32;
+        let by = (i / m.width) as i32;
+        // Faux italic: shear top rows right (fallback only).
+        let shear = if faux_italic {
+            ((m.height as i32 - 1 - by) as f32 * 0.15) as i32
+        } else {
+            0
+        };
+        let dx = pen_x + m.xmin + bx + shear;
+        let dy = top + by;
+        if dx >= 0 && dy >= 0 {
+            blend(dst, dx as u32, dy as u32, fg, cov);
+            // Faux bold: double-strike one unscaled pixel right.
+            if faux_bold {
+                blend(dst, (dx + u) as u32, dy as u32, fg, cov);
+            }
+        }
+    }
+}
+
 /// Render a validated frame to PNG bytes under `profile`.
 ///
-/// One-shot convenience: constructs a fresh [`Renderer`] per call (5 font
+/// One-shot convenience: constructs a fresh [`Renderer`] per call (8 font
 /// parses, cold glyph cache). Bulk gates should keep a `Renderer` instead.
 pub fn render_png(
     frame: &Frame,
@@ -618,7 +826,7 @@ pub fn render_png(
 
 /// Render plus exact coverage accounting (see [`Fidelity`]).
 ///
-/// One-shot convenience: constructs a fresh [`Renderer`] per call (5 font
+/// One-shot convenience: constructs a fresh [`Renderer`] per call (8 font
 /// parses, cold glyph cache). Bulk gates should keep a `Renderer` instead.
 pub fn render_png_report(
     frame: &Frame,

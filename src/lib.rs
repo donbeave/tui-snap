@@ -39,7 +39,9 @@ pub use termlens;
 pub use frame::{Cell, Color, Cursor, CursorStyle, Frame, FrameError, Mods, Provenance, Rgb};
 pub use grouped::{ArtifactPaths, GroupedOutcome, GroupedStore, InvalidName};
 pub use profile::{
-    FontFaces, Profile, VENDORED_FACES, VENDORED_FONT, VENDORED_FONT_BOLD,
-    VENDORED_FONT_BOLD_ITALIC, VENDORED_FONT_ITALIC,
+    FallbackFace, FontFaces, Profile, VENDORED_CJK_FONT, VENDORED_CJK_FONT_SHA256,
+    VENDORED_FACES, VENDORED_FALLBACK_FACES, VENDORED_FONT, VENDORED_FONT_BOLD,
+    VENDORED_FONT_BOLD_ITALIC, VENDORED_FONT_ITALIC, VENDORED_SYMBOLS2_FONT,
+    VENDORED_SYMBOLS2_FONT_SHA256, VENDORED_SYMBOLS_FONT, VENDORED_SYMBOLS_FONT_SHA256,
 };
 pub use render::Renderer;

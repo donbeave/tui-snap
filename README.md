@@ -81,7 +81,8 @@ tuisnap run --cols 120 --rows 40 --send enter --wait-for Ready \
   --store shots --name home -- ./my-tui                # capture + gate
 ```
 
-`render` also accepts `--font-file` (hash recorded); all gates accept it too.
+`render` also accepts `--font-file` (hash recorded); all gates accept it too
+(the fallback chain below still applies on top of an override).
 Offline `frame.json` re-renders byte-identical PNGs (proven by tests).
 
 Git/path library dependencies include the pinned PTY engine (termpane v0.1.0
@@ -105,7 +106,7 @@ python3 tools/test_migration.py
 ```text
 <store>/approved/<name>.frame.json   # the only committed artifact (compact JSON)
 <store>/actual/<name>.frame.json     # local evidence (gitignored)
-<store>/actual/<name>.png            # + <name>.png.fidelity.json (missing glyphs)
+<store>/actual/<name>.png            # + <name>.png.fidelity.json (missing/fallback glyphs)
 <store>/diff/<name>.png              # red-overlay diff, on mismatch
 <store>/report.html                  # portable: embedded PNGs + frame JSON
 ```
@@ -165,10 +166,48 @@ in detail.
 - Bold / italic / bold-italic render with the REAL faces of the vendored
   JetBrainsMono Nerd Font Mono family; the faux double-strike / shear survive
   only when a face fails to load or `--font-file` overrides with one face.
-- Covered: box drawing, blocks, Braille, Nerd icons, combining marks.
-  CJK/emoji/⚷ (U+26B7) without font coverage render as deterministic tofu
-  with correct advance AND are reported in `<name>.png.fidelity.json` next to
-  every PNG output (documented in `assets/fonts/FONTS.md`).
+- Covered by the primary family: box drawing, blocks, Braille, Nerd icons,
+  combining marks. What it lacks is served per-glyph by the vendored fallback
+  chain (below). Codepoints NO face covers (color emoji, Hangul, JIS level-2
+  kanji) render as deterministic tofu with correct advance AND are reported
+  in `<name>.png.fidelity.json` next to every PNG output (documented in
+  `assets/fonts/FONTS.md`).
+
+## Font fallback
+
+The PNG path never uses system fonts (determinism across machines). Per
+glyph the renderer tries: styled primary face → regular primary face →
+pinned fallback faces in order → tofu + fidelity record. The default chain
+([`VENDORED_FALLBACK_FACES`]) is three vendored Noto subsets, sha256-pinned
+and verified at load (SIL OFL 1.1, `assets/fonts/LICENSE-Noto.txt`):
+
+| Face | Covers | Size |
+|---|---|---|
+| Noto Sans Symbols 2 subset | ◐ ★ ☕ ❤ ✔ ⬤ — Geometric Shapes, Misc Symbols, Dingbats, Misc Symbols & Arrows | 87 KB |
+| Noto Sans Symbols subset | ⚷ ⚙ ♻ — misc symbols unique to v1 (U+2600–U+26FF) | 27 KB |
+| Noto Sans CJK JP subset | 東京 — kana, JIS X 0208 level-1 kanji, fullwidth forms | 679 KB |
+
+`Renderer::new` loads this chain; primary-covered frames render
+BYTE-IDENTICAL with or without it (pinned by
+`tests/render.rs::primary_covered_fixtures_match_pre_fallback_render_bytes`).
+Fallback glyphs draw centered and clipped inside the primary cell box; the
+cell grid never moves. Cells served by a fallback face are listed in the
+sidecar's `fallback_glyphs` (omitted when empty, so existing sidecars stay
+byte-stable). Register your own faces (or render primary-only) with
+[`Renderer::with_fallbacks`]; each face carries its own sha256 pin:
+
+```rust
+let chain = [tuisnap::FallbackFace {
+    bytes: MY_FONT,
+    sha256: MY_FONT_SHA256,   // verified at load; mismatch refuses to render
+    desc: "my extra symbols",
+}];
+let mut r = tuisnap::render::Renderer::with_fallbacks(&profile, &faces, &chain)?;
+```
+
+The subsets are reproducible and extensible (JIS level-2, Hangul, more
+blocks): `python3 tools/subset_fonts.py` re-downloads commit-pinned upstreams,
+re-subsets, and prints the new hashes to pin — see `assets/fonts/FONTS.md`.
 - Terminal-like, measured fidelity — NOT pixel-identity with any terminal
   emulator; cell data stays authoritative for styles.
 
