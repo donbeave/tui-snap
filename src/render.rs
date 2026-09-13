@@ -905,6 +905,14 @@ fn esc_xml(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Attribute-context escape: [`esc_xml`] plus quotes so a value cannot
+/// break out of `alt="..."` / `title="..."`. SVG text content stays on
+/// [`esc_xml`] so cell `"` is not rewritten to `&quot;` (HTML snapshots
+/// with quoted cell text must keep their bytes).
+fn esc_attr(s: &str) -> String {
+    esc_xml(s).replace('"', "&quot;").replace('\'', "&#39;")
+}
+
 /// Selectable-text SVG (secondary evidence: viewer fonts apply, so the PNG
 /// stays authoritative for pixel gates).
 pub fn render_svg(frame: &Frame, profile: &Profile) -> String {
@@ -1034,8 +1042,8 @@ fn html_document(frame: &Frame, profile: &Profile, title: &str, png: &[u8]) -> S
     embedded.provenance.created_unix = 0;
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{background:#141414;margin:24px}}.shot{{position:relative;display:inline-block;line-height:0}}.shot>img{{display:block;image-rendering:pixelated}}.shot>svg{{position:absolute;inset:0;width:100%;height:100%}}.shot>svg rect,.shot>svg text{{fill:transparent!important}}</style></head><body><div class=\"shot\"><img src=\"data:image/png;base64,{b64}\" alt=\"{}\" width=\"{png_w}\" height=\"{png_h}\">{svg}</div><script type=\"application/json\">{}</script></body></html>",
-        esc_xml(title),
-        esc_xml(title),
+        esc_attr(title),
+        esc_attr(title),
         crate::snapshot::json_for_script(&embedded.to_json())
     )
 }
@@ -1102,4 +1110,40 @@ fn sgr_for(c: &crate::frame::Cell) -> String {
     push_color(&mut p, 38, c.fg);
     push_color(&mut p, 48, c.bg);
     p.join(";")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::{Frame, Provenance};
+
+    #[test]
+    fn html_alt_escapes_quote_breakout() {
+        let frame = Frame::blank(
+            2,
+            1,
+            Provenance {
+                tool: "tuisnap".into(),
+                tool_version: "test".into(),
+                profile: "tuisnap-default".into(),
+                source: "test".into(),
+                argv: vec![],
+                created_unix: 0,
+            },
+        );
+        let html = html_document(
+            &frame,
+            &Profile::default_profile(),
+            r#"x" onload="#,
+            b"",
+        );
+        assert!(
+            html.contains(r#"alt="x&quot; onload=""#),
+            "{html}"
+        );
+        assert!(
+            !html.contains(r#"alt="x" onload="#),
+            "raw attribute breakout: {html}"
+        );
+    }
 }
