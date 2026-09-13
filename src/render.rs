@@ -17,8 +17,11 @@
 //!   to load or the family is a single-face override);
 //! - per-glyph face chain: styled face → regular face → vendored fallback
 //!   faces ([`crate::profile::VENDORED_FALLBACK_FACES`], sha256-pinned Noto
-//!   subsets) → tofu; fallback glyphs are centered and clipped inside the
-//!   primary cell box and drawn in the fallback face's own weight;
+//!   subsets) → tofu; a face covers a codepoint only when it rasterizes a
+//!   non-empty bitmap (cmap index is not enough); fallback glyphs are
+//!   centered and clipped inside the primary cell box and drawn in the
+//!   fallback face's own weight; default-ignorable codepoints (VS16, ZWJ)
+//!   never tofu;
 //! - underline / strikethrough drawn at fixed offsets from the baseline,
 //!   including across whitespace cells (as real terminals do);
 //! - blink frozen as visible; concealed glyphs omitted (see [`crate::frame`]);
@@ -318,11 +321,8 @@ impl Renderer {
         let unscaled = load_font(faces.regular, profile.font_px)?;
         verify_geometry(&unscaled, profile)?;
         // HiDPI: rasterize glyphs at the final scale, no post upscale.
-        let set = FontSet::load_with_fallbacks(
-            faces,
-            profile.font_px * profile.scale as f32,
-            fallbacks,
-        )?;
+        let set =
+            FontSet::load_with_fallbacks(faces, profile.font_px * profile.scale as f32, fallbacks)?;
         Ok(Self {
             profile: profile.clone(),
             set,
@@ -347,10 +347,11 @@ impl Renderer {
         Ok(self.render(frame)?.png)
     }
 
-    /// Standalone colored HTML render of a frame: the selectable SVG as the
-    /// primary visual, the authoritative PNG embedded as base64 under
-    /// `<details>`, and the canonical frame JSON embedded in a
-    /// `<script type="application/json">` element for lossless re-import.
+    /// Standalone colored HTML render of a frame: the authoritative PNG as
+    /// the primary `<img>` (real glyphs, including CJK/symbols the viewer
+    /// font would tofu), a selectable SVG overlay with transparent fills
+    /// (viewer fonts, copy/select only), and the canonical frame JSON
+    /// embedded in a `<script type="application/json">` for lossless re-import.
     ///
     /// The embedded JSON carries `provenance.created_unix = 0`: the timestamp
     /// is informational only (excluded from every gate by design), and
@@ -570,13 +571,7 @@ fn fill_rect(dst: &mut image::RgbImage, x: u32, y: u32, w: u32, h: u32, c: Rgb) 
 fn draw_tofu(dst: &mut image::RgbImage, x0: i32, top: i32, span_px: u32, h: u32, fg: Rgb, u: i32) {
     let w = (span_px as i32 - 2 * u).max(3 * u);
     for dx in 0..w {
-        blend(
-            dst,
-            (x0 + u + dx).max(0) as u32,
-            top.max(0) as u32,
-            fg,
-            255,
-        );
+        blend(dst, (x0 + u + dx).max(0) as u32, top.max(0) as u32, fg, 255);
         blend(
             dst,
             (x0 + u + dx).max(0) as u32,
@@ -612,15 +607,72 @@ struct CellSinks<'a> {
     fallback: &'a mut Vec<FallbackGlyph>,
 }
 
+/// Default_Ignorable codepoints (variation selectors, ZWJ, …) carry no ink
+/// of their own. They must not count as uncovered: a cell like `☕`+U+FE0F
+/// would otherwise draw tofu on top of a real glyph (cmap-only coverage
+/// treated the selector as a miss). Combining marks are NOT ignorable and
+/// still overlay at the same origin.
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Rasterize `c` from `face` once (negatives cached). Coverage is **ink**,
+/// not cmap index: an empty outline (Nerd-Font placeholder, failed CFF,
+/// zero bitmap) does not cover, so the chain can try the next face.
+fn cached_raster<'a>(
+    cache: &'a mut GlyphCache,
+    face: &LoadedFont,
+    idx: FaceIdx,
+    c: char,
+) -> Option<&'a (fontdue::Metrics, Vec<u8>)> {
+    cache
+        .entry(GlyphKey { ch: c, face: idx })
+        .or_insert_with(|| {
+            if face.font.lookup_glyph_index(c) == 0 {
+                return None;
+            }
+            let (m, bmp) = face.font.rasterize(c, face.px);
+            if m.width == 0 || m.height == 0 || bmp.iter().all(|&p| p == 0) {
+                None
+            } else {
+                Some((m, bmp))
+            }
+        })
+        .as_ref()
+}
+
 /// Draw one lead-cell symbol at pen origin. Combining scalars overlay at the
 /// same origin (documented approximation of terminal combining behavior).
 /// Face chain: styled face → regular face → fallback faces in chain order →
-/// tofu (recorded in `sinks.missing`). Faux styles apply only when the
-/// regular face serves a cell whose mods asked for a styled face. Fallback
-/// glyphs draw in their face's own weight, centered horizontally in the cell
-/// span and clipped to the cell rect (fallback faces have their own metrics;
-/// the primary cell grid never moves). Rasters come from `cache` (per
-/// `(char, face)`, negatives included) instead of re-rasterizing per cell.
+/// tofu (recorded in `sinks.missing`). A face covers a codepoint only when
+/// it produces a non-empty bitmap — cmap-only hits with empty outlines fall
+/// through (otherwise Nerd-Font placeholders / un-rasterizable CFF would
+/// block Noto). Faux styles apply only when the regular face serves a cell
+/// whose mods asked for a styled face. Fallback glyphs draw in their face's
+/// own weight, centered horizontally in the cell span and clipped to the
+/// cell rect (fallback faces have their own metrics; the primary cell grid
+/// never moves). Rasters come from `cache` (per `(char, face)`, negatives
+/// included) instead of re-rasterizing per cell.
 #[allow(clippy::too_many_arguments)]
 fn draw_symbol(
     dst: &mut image::RgbImage,
@@ -643,48 +695,57 @@ fn draw_symbol(
     let mut uncovered: Vec<char> = Vec::new();
     let mut served: Vec<(char, u8)> = Vec::new();
     for c in symbol.chars() {
+        if is_default_ignorable(c) {
+            continue;
+        }
         // Face chain: styled → regular → fallbacks in order → missing.
+        // Coverage = non-empty raster, not lookup_glyph_index != 0.
         enum Pick {
             Styled,
             Regular,
             Fallback(usize),
             Missing,
         }
-        let pick = if styled.font.lookup_glyph_index(c) != 0 {
+        let pick = if cached_raster(cache, styled, styled_idx, c).is_some() {
             Pick::Styled
-        } else if set.regular.font.lookup_glyph_index(c) != 0 {
+        } else if cached_raster(cache, &set.regular, FaceIdx::Regular, c).is_some() {
             Pick::Regular
-        } else if let Some(fi) = set
-            .fallbacks
-            .iter()
-            .position(|f| f.font.lookup_glyph_index(c) != 0)
-        {
+        } else if let Some(fi) = (0..set.fallbacks.len()).find(|&fi| {
+            cached_raster(cache, &set.fallbacks[fi], FaceIdx::Fallback(fi as u8), c).is_some()
+        }) {
             Pick::Fallback(fi)
         } else {
             Pick::Missing
         };
         match pick {
             Pick::Styled => {
-                draw_primary(cache, dst, styled, styled_idx, c, pen_x, baseline, fg, false, false, u);
+                draw_primary(
+                    cache, dst, styled, styled_idx, c, pen_x, baseline, fg, false, false, u,
+                );
             }
             Pick::Regular => {
-                draw_primary(cache, dst, &set.regular, FaceIdx::Regular, c, pen_x, baseline, fg, bold, italic, u);
+                draw_primary(
+                    cache,
+                    dst,
+                    &set.regular,
+                    FaceIdx::Regular,
+                    c,
+                    pen_x,
+                    baseline,
+                    fg,
+                    bold,
+                    italic,
+                    u,
+                );
             }
             Pick::Missing => {
                 uncovered.push(c);
             }
             Pick::Fallback(fi) => {
-                let face = &set.fallbacks[fi];
                 let idx = FaceIdx::Fallback(fi as u8);
-                let cached = cache.entry(GlyphKey { ch: c, face: idx }).or_insert_with(|| {
-                    let (m, bmp) = face.font.rasterize(c, face.px);
-                    if m.width == 0 || m.height == 0 {
-                        None
-                    } else {
-                        Some((m, bmp))
-                    }
-                });
-                let Some((m, bmp)) = cached else {
+                let Some((m, bmp)) = cached_raster(cache, &set.fallbacks[fi], idx, c).cloned()
+                else {
+                    uncovered.push(c);
                     continue;
                 };
                 // Center the glyph's advance box in the cell span; clip ink
@@ -713,6 +774,10 @@ fn draw_symbol(
                 }
                 if inked {
                     served.push((c, fi as u8));
+                } else {
+                    // Raster existed but every pixel sat outside the cell
+                    // box: still a miss, not a silent blank.
+                    uncovered.push(c);
                 }
             }
         }
@@ -730,7 +795,10 @@ fn draw_symbol(
                 x: s.x,
                 y: s.y,
                 symbol: symbol.to_string(),
-                codepoints: served.iter().map(|(c, _)| format!("U+{:04X}", *c as u32)).collect(),
+                codepoints: served
+                    .iter()
+                    .map(|(c, _)| format!("U+{:04X}", *c as u32))
+                    .collect(),
                 faces,
             });
         }
@@ -752,7 +820,10 @@ fn draw_symbol(
             x: s.x,
             y: s.y,
             symbol: symbol.to_string(),
-            codepoints: uncovered.iter().map(|c| format!("U+{:04X}", *c as u32)).collect(),
+            codepoints: uncovered
+                .iter()
+                .map(|c| format!("U+{:04X}", *c as u32))
+                .collect(),
         });
     }
 }
@@ -774,15 +845,7 @@ fn draw_primary(
     faux_italic: bool,
     u: i32,
 ) {
-    let cached = cache.entry(GlyphKey { ch: c, face: idx }).or_insert_with(|| {
-        let (m, bmp) = face.font.rasterize(c, face.px);
-        if m.width == 0 || m.height == 0 {
-            None
-        } else {
-            Some((m, bmp))
-        }
-    });
-    let Some((m, bmp)) = cached else {
+    let Some((m, bmp)) = cached_raster(cache, face, idx, c) else {
         return;
     };
     // ymin = offset of the bitmap's BOTTOM edge from the baseline, so the
@@ -963,16 +1026,15 @@ pub fn render_svg(frame: &Frame, profile: &Profile) -> String {
 fn html_document(frame: &Frame, profile: &Profile, title: &str, png: &[u8]) -> String {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(png);
-    let (png_w, _) = profile.image_size(frame.cols, frame.rows);
-    let svg = render_svg(frame, profile).replacen(
-        "<svg ",
-        &format!("<svg style=\"width:{png_w}px;height:auto\" "),
-        1,
-    );
+    let (png_w, png_h) = profile.image_size(frame.cols, frame.rows);
+    // SVG is a selectable overlay only: its fills are forced transparent so
+    // viewer fonts cannot tofu-over the PNG. Copy/select still works.
+    let svg = render_svg(frame, profile);
     let mut embedded = frame.clone();
     embedded.provenance.created_unix = 0;
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{background:#141414;margin:24px}}svg{{display:block}}details{{color:#ccc;margin-top:12px}}img{{max-width:100%}}</style></head><body>{svg}<details><summary>authoritative PNG (pixel-gate evidence)</summary><img src=\"data:image/png;base64,{b64}\" alt=\"frame\"></details><script type=\"application/json\">{}</script></body></html>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{background:#141414;margin:24px}}.shot{{position:relative;display:inline-block;line-height:0}}.shot>img{{display:block;image-rendering:pixelated}}.shot>svg{{position:absolute;inset:0;width:100%;height:100%}}.shot>svg rect,.shot>svg text{{fill:transparent!important}}</style></head><body><div class=\"shot\"><img src=\"data:image/png;base64,{b64}\" alt=\"{}\" width=\"{png_w}\" height=\"{png_h}\">{svg}</div><script type=\"application/json\">{}</script></body></html>",
+        esc_xml(title),
         esc_xml(title),
         crate::snapshot::json_for_script(&embedded.to_json())
     )
@@ -980,7 +1042,8 @@ fn html_document(frame: &Frame, profile: &Profile, title: &str, png: &[u8]) -> S
 
 /// Normalized ANSI dump (SGR runs from canonical state — for debugging, not
 /// for replay; replay raw streams with [`crate::ansi::replay_raw`]).
-pub fn ansi_dump(frame: &Frame) -> String {    let mut out = String::new();
+pub fn ansi_dump(frame: &Frame) -> String {
+    let mut out = String::new();
     for y in 0..frame.rows {
         let mut cur = String::new();
         for x in 0..frame.cols {

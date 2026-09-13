@@ -127,12 +127,9 @@ fn bold_and_italic_use_real_faces_not_faux() {
         italic: true,
         ..Default::default()
     };
-    let real = tuisnap::render::render_png(
-        &frame_with_mods("real", bold),
-        &profile(),
-        &VENDORED_FACES,
-    )
-    .unwrap();
+    let real =
+        tuisnap::render::render_png(&frame_with_mods("real", bold), &profile(), &VENDORED_FACES)
+            .unwrap();
     // Single-face chain: bold falls back to the faux double-strike, which
     // must differ from the real Bold face.
     let faux = tuisnap::render::render_png(
@@ -162,7 +159,10 @@ fn fidelity_reports_missing_glyphs_exactly() {
     // 🦀 (U+1F980) is not covered by the vendored family (see FONTS.md).
     let frame = tuisnap::ratatui::widget_frame(Paragraph::new("ok 🦀"), 20, 5, prov());
     let r = tuisnap::render::render_png_report(&frame, &profile(), &VENDORED_FACES).unwrap();
-    assert!(r.fidelity.approximate, "uncovered glyph must mark approximate");
+    assert!(
+        r.fidelity.approximate,
+        "uncovered glyph must mark approximate"
+    );
     assert_eq!(r.fidelity.missing.len(), 1);
     let m = &r.fidelity.missing[0];
     assert_eq!(m.symbol, "🦀");
@@ -304,9 +304,12 @@ fn whitespace_cells_keep_underline_and_strikethrough() {
             prov(),
         )
     };
-    let plain =
-        tuisnap::render::render_png(&styled_frame(Modifier::empty()), &profile(), &VENDORED_FACES)
-            .unwrap();
+    let plain = tuisnap::render::render_png(
+        &styled_frame(Modifier::empty()),
+        &profile(),
+        &VENDORED_FACES,
+    )
+    .unwrap();
     for (label, m) in [
         ("underline", Modifier::UNDERLINED),
         ("strikethrough", Modifier::CROSSED_OUT),
@@ -352,9 +355,7 @@ fn svg_carries_text_decorations_across_spaces() {
     assert!(svg.contains(">a  b</text>"), "{svg}");
     // Plain runs stay undecorated.
     let plain = tuisnap::ratatui::widget_frame(Paragraph::new("a  b"), 10, 3, prov());
-    assert!(
-        !tuisnap::render::render_svg(&plain, &profile()).contains("text-decoration"),
-    );
+    assert!(!tuisnap::render::render_svg(&plain, &profile()).contains("text-decoration"),);
 }
 
 #[test]
@@ -419,6 +420,12 @@ fn cursor_styles_render() {
 /// Ink strictly inside cell `(x, y=0)` excluding the margin the deterministic
 /// tofu box's outline occupies: tofu scores 0, a real glyph scores plenty.
 fn interior_ink(png: &[u8], x: u16, span_cells: u32) -> usize {
+    cell_stats(png, x, span_cells).0
+}
+
+/// `(interior_ink, unique_colors_in_full_cell)`. Hollow tofu is 2 colors
+/// (bg + solid outline); a real antialiased glyph is dozens.
+fn cell_stats(png: &[u8], x: u16, span_cells: u32) -> (usize, usize) {
     let img = image::load_from_memory(png).unwrap().to_rgb8();
     let bg = image::Rgb([0u8, 0, 0]);
     let (cw, ch, pad, u) = (10u32, 21u32, 12u32, 2u32);
@@ -426,6 +433,12 @@ fn interior_ink(png: &[u8], x: u16, span_cells: u32) -> usize {
     let top = pad * u;
     let (span, height) = (span_cells * cw * u, ch * u);
     let mut n = 0;
+    let mut colors = std::collections::BTreeSet::new();
+    for dy in 0..height {
+        for dx in 0..span {
+            colors.insert(img.get_pixel(pen + dx, top + dy).0);
+        }
+    }
     for dy in 5..(height - 6) {
         for dx in 3..(span - 4) {
             if img.get_pixel(pen + dx, top + dy) != &bg {
@@ -433,7 +446,7 @@ fn interior_ink(png: &[u8], x: u16, span_cells: u32) -> usize {
             }
         }
     }
-    n
+    (n, colors.len())
 }
 
 #[test]
@@ -442,8 +455,15 @@ fn fallback_faces_render_the_previously_missing_set() {
     // 東 京 ☕ ⚷ ◐ ★ (U+6771 U+4EAC U+2615 U+26B7 U+25D0 U+2605).
     let frame = tuisnap::ratatui::widget_frame(Paragraph::new("東京 ☕ ⚷ ◐ ★"), 30, 4, prov());
     let r = tuisnap::render::render_png_report(&frame, &profile(), &VENDORED_FACES).unwrap();
-    assert!(r.fidelity.missing.is_empty(), "missing: {:?}", r.fidelity.missing);
-    assert!(!r.fidelity.approximate, "fully served by real faces: not approximate");
+    assert!(
+        r.fidelity.missing.is_empty(),
+        "missing: {:?}",
+        r.fidelity.missing
+    );
+    assert!(
+        !r.fidelity.approximate,
+        "fully served by real faces: not approximate"
+    );
     let served: Vec<String> = r
         .fidelity
         .fallback_glyphs
@@ -451,15 +471,19 @@ fn fallback_faces_render_the_previously_missing_set() {
         .flat_map(|g| g.codepoints.clone())
         .collect();
     for cp in ["U+6771", "U+4EAC", "U+2615", "U+26B7", "U+25D0", "U+2605"] {
-        assert!(served.contains(&cp.to_string()), "{cp} not fallback-served: {served:?}");
+        assert!(
+            served.contains(&cp.to_string()),
+            "{cp} not fallback-served: {served:?}"
+        );
     }
     let json = r.fidelity.to_json();
     assert!(json.contains("fallback_glyphs"), "{json}");
     assert!(json.contains("NotoSansSymbols2 subset"), "{json}");
     assert!(json.contains("NotoSansSymbols subset"), "{json}");
     assert!(json.contains("NotoSansCJKjp subset"), "{json}");
-    // Non-tofu pixels: every glyph cell has interior ink (tofu has none).
-    // Widths follow the frame model: 東 京 ☕ are wide (2 cells), ⚷ ◐ ★ narrow.
+    // Non-tofu pixels: every glyph cell has interior ink (tofu has none)
+    // AND more than the 2 colors of a hollow outline. Widths follow the
+    // frame model: 東 京 ☕ are wide (2 cells), ⚷ ◐ ★ narrow.
     for (x, span, label) in [
         (0u16, 2u32, "東"),
         (2, 2, "京"),
@@ -468,9 +492,14 @@ fn fallback_faces_render_the_previously_missing_set() {
         (10, 1, "◐"),
         (12, 1, "★"),
     ] {
+        let (ink, ncolors) = cell_stats(&r.png, x, span);
         assert!(
-            interior_ink(&r.png, x, span) > 20,
-            "{label} at cell {x} rendered as tofu or blank"
+            ink > 20,
+            "{label} at cell {x} rendered as tofu or blank (ink={ink})"
+        );
+        assert!(
+            ncolors > 8,
+            "{label} at cell {x} is a {ncolors}-color box (hollow tofu is 2)"
         );
     }
     // Without the fallback chain the same frame is tofu + missing records,
@@ -483,17 +512,60 @@ fn fallback_faces_render_the_previously_missing_set() {
     assert!(tofu.fidelity.fallback_glyphs.is_empty());
     assert_ne!(tofu.png, r.png);
     for (x, span) in [(0u16, 2u32), (2, 2), (5, 2), (8, 1), (10, 1), (12, 1)] {
-        assert_eq!(interior_ink(&tofu.png, x, span), 0, "cell {x} must be hollow tofu");
+        let (ink, ncolors) = cell_stats(&tofu.png, x, span);
+        assert_eq!(ink, 0, "cell {x} must be hollow tofu");
+        assert_eq!(
+            ncolors, 2,
+            "cell {x} hollow tofu is bg+outline, got {ncolors} colors"
+        );
     }
+}
+
+#[test]
+fn cjk_star_coffee_cells_are_not_hollow_tofu() {
+    // Consumer audit: 東京 / ★ / ☕ rasterized as 2-color ~8% ink outlines
+    // even after the fallback faces were vendored, because coverage was
+    // cmap-index-only and HTML showed viewer-font SVG. This is the ink
+    // contract those snapshots must meet after recapture.
+    let frame = tuisnap::ratatui::widget_frame(Paragraph::new("東京 ★ ☕\u{fe0f}"), 20, 3, prov());
+    let r = tuisnap::render::render_png_report(&frame, &profile(), &VENDORED_FACES).unwrap();
+    assert!(
+        r.fidelity.missing.is_empty(),
+        "VS16 must not tofu: {:?}",
+        r.fidelity.missing
+    );
+    for (x, span, label) in [(0u16, 2u32, "東"), (2, 2, "京"), (5, 1, "★"), (7, 2, "☕")] {
+        let (ink, ncolors) = cell_stats(&r.png, x, span);
+        assert!(ink > 20, "{label} cell {x} near-empty ink={ink}");
+        assert!(ncolors > 8, "{label} cell {x} {ncolors}-color tofu-like");
+    }
+    let html = tuisnap::render::Renderer::new(&profile(), &VENDORED_FACES)
+        .unwrap()
+        .render_html(&frame, "glyphs")
+        .unwrap();
+    let body = html.split("<body>").nth(1).expect("body");
+    let img = body.find("<img ").expect("primary img");
+    let details = body.find("<details");
+    assert!(
+        details.is_none() || img < details.unwrap(),
+        "authoritative PNG must be the primary visual, not hidden in details"
+    );
+    assert!(body[..img].contains("class=\"shot\""), "{body}");
+    assert!(html.contains("data:image/png;base64,"), "{html}");
 }
 
 #[test]
 fn fallback_render_is_byte_deterministic() {
     let render = || {
-        let frame = tuisnap::ratatui::widget_frame(Paragraph::new("東京 ☕ ⚷ ◐ ★ ❤ ●"), 30, 4, prov());
+        let frame =
+            tuisnap::ratatui::widget_frame(Paragraph::new("東京 ☕ ⚷ ◐ ★ ❤ ●"), 30, 4, prov());
         tuisnap::render::render_png(&frame, &profile(), &VENDORED_FACES).unwrap()
     };
-    assert_eq!(render(), render(), "same frame, fresh renderers: same bytes");
+    assert_eq!(
+        render(),
+        render(),
+        "same frame, fresh renderers: same bytes"
+    );
     let mut r = tuisnap::render::Renderer::new(&profile(), &VENDORED_FACES).unwrap();
     let frame = tuisnap::ratatui::widget_frame(Paragraph::new("東京 ☕ ⚷ ◐ ★ ❤ ●"), 30, 4, prov());
     let a = r.render(&frame).unwrap().png;
@@ -594,7 +666,10 @@ fn primary_covered_frames_are_byte_identical_with_and_without_fallbacks() {
         tuisnap::render::Renderer::with_fallbacks(&profile(), &VENDORED_FACES, &[]).unwrap();
     let a = with.render(&frame).unwrap();
     let b = without.render(&frame).unwrap();
-    assert_eq!(a.png, b.png, "fallback chain must not move primary-covered pixels");
+    assert_eq!(
+        a.png, b.png,
+        "fallback chain must not move primary-covered pixels"
+    );
     assert_eq!(a.fidelity.to_json(), b.fidelity.to_json());
     assert!(
         !a.fidelity.to_json().contains("fallback_glyphs"),
@@ -626,7 +701,11 @@ fn primary_covered_fixtures_match_pre_fallback_render_bytes() {
             r.png, baseline,
             "{name}: primary-covered render drifted from the pre-fallback bytes"
         );
-        assert!(r.fidelity.missing.is_empty(), "{name}: {:?}", r.fidelity.missing);
+        assert!(
+            r.fidelity.missing.is_empty(),
+            "{name}: {:?}",
+            r.fidelity.missing
+        );
         assert!(r.fidelity.fallback_glyphs.is_empty(), "{name}");
         let baseline_fidelity =
             std::fs::read_to_string(baselines.join(format!("{name}.png.fidelity.json"))).unwrap();

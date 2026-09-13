@@ -222,8 +222,8 @@ fn render_formats(
             "svg" => std::fs::write(&path, tuisnap::render::render_svg(frame, profile))?,
             "html" => {
                 // Standalone colored render, built by the library
-                // (`Renderer::render_html`): selectable SVG primary visual,
-                // authoritative PNG under <details>, frame JSON embedded.
+                // (`Renderer::render_html`): authoritative PNG primary
+                // visual, selectable SVG overlay, frame JSON embedded.
                 let html = renderer_cached(&mut renderer, profile, faces)?
                     .render_html(frame, name)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;

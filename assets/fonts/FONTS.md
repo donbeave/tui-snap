@@ -129,8 +129,9 @@ faces render in their own regular weight regardless of `cell.mods`.
 | Hangul, JIS X 0208 level-2 kanji | NOT covered → deterministic tofu box + fidelity report (subset extensible, see above) |
 | Color emoji (e.g. U+1F980 🦀) | NOT covered → tofu + fidelity report |
 
-Missing glyphs are detected via `lookup_glyph_index == 0` across the whole
-face chain and drawn as an outline box; every miss is listed with position
+Missing glyphs are detected when no face in the chain produces a non-empty
+bitmap (cmap index alone is not coverage — empty Nerd-Font placeholders
+must not block Noto) and drawn as an outline box; every miss is listed with position
 and `U+XXXX` codepoints in `<name>.png.fidelity.json` next to each PNG
 output (`render --format png` and store `actual/`/`approved/` pairs) —
 exact reporting, never silent tofu. Cells served by a fallback face are

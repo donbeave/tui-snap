@@ -434,4 +434,10 @@ fn html_artifact_is_a_standalone_colored_render() {
     assert!(html.contains("data:image/png;base64,"), "{html}");
     assert!(html.contains("<script type=\"application/json\">"), "{html}");
     assert!(html.contains("<title>docs/preview</title>"), "{html}");
+    let body = html.split("<body>").nth(1).unwrap();
+    let img = body.find("<img ").expect("png img");
+    assert!(
+        !body[..img].contains("<details"),
+        "PNG must be the primary visual, not nested under details: {html}"
+    );
 }
