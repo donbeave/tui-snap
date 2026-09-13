@@ -19,7 +19,7 @@
 //! <actual>/<name>.{ansi,txt,png,html}   latest capture (written BEFORE any assertion)
 //! <actual>/<name>.frame.json            debug sidecar (report re-verification)
 //! <actual>/<name>.png.fidelity.json     missing-glyph sidecar
-//! <actual>/report.html                  portable expected/actual/diff report
+//! <actual>/report.html                  review index (file links, not embeds)
 //! <diff>/<name>.png                     red-overlay diff, on mismatch
 //! ```
 //!
@@ -498,12 +498,9 @@ impl GroupedStore {
         Ok(names)
     }
 
-    /// Re-verify every actual scenario and rewrite the HTML report — the
-    /// grouped form of [`crate::snapshot::Store::report`]. Unmatched gates
-    /// do not error here: inspect [`StoreReport::failed`] and the outcomes.
-    ///
-    /// This constructs a fresh [`Renderer`] per call; bulk callers should
-    /// build one and use [`Self::report_with`].
+    /// Rewrite the HTML review index from on-disk actual vs approved
+    /// artifacts. Does not re-render. Unmatched gates do not error here:
+    /// inspect [`StoreReport::failed`] and the outcomes.
     pub fn report(
         &self,
         profile: &Profile,
@@ -515,29 +512,72 @@ impl GroupedStore {
         self.report_with(&mut renderer, pixel_threshold, title)
     }
 
-    /// [`Self::report`] through a caller-owned [`Renderer`].
+    /// Fast review index: compare on-disk actual vs approved bytes. Does
+    /// **not** re-render PNGs — that is each capture test's job. HTML links
+    /// the PNG files; it does not embed them.
     pub fn report_with(
         &self,
         renderer: &mut Renderer,
-        pixel_threshold: f64,
+        _pixel_threshold: f64,
         title: &str,
     ) -> Result<StoreReport, SnapshotError> {
         let names = self.actual_names()?;
         let mut entries = Vec::new();
         let mut outcomes = Vec::new();
+        let profile = renderer.profile().clone();
         for name in names {
-            let frame_path = artifact_paths(&self.actual_root, &name).frame_json;
-            let text = std::fs::read_to_string(&frame_path).map_err(|e| {
-                SnapshotError(format!("cannot read actual frame for `{name}`: {e}"))
-            })?;
-            let frame = Frame::from_json(&text)?;
-            let grouped = self.check_with(renderer, &name, &frame, pixel_threshold)?;
-            entries.push(report_entry(&grouped.outcome, renderer.profile())?);
-            outcomes.push(grouped.outcome);
+            let outcome = self.disk_outcome(&name)?;
+            entries.push(report_entry(&outcome, &profile)?);
+            outcomes.push(outcome);
         }
         let path = write_report_at(&self.report_path(), title, &entries)?;
         Ok(StoreReport { path, outcomes })
     }
+
+    fn disk_outcome(&self, name: &str) -> Result<CompareOutcome, SnapshotError> {
+        let actual = artifact_paths(&self.actual_root, name);
+        let approved = artifact_paths(&self.approved_root, name);
+        let status = disk_status(&approved, &actual)?;
+        let diff = {
+            let p = sibling_diff(&self.diff_root, name);
+            p.exists().then_some(p)
+        };
+        Ok(CompareOutcome {
+            name: name.to_string(),
+            status,
+            cell_diffs: Vec::new(),
+            cell_diff_total: 0,
+            pixel_score: matches!(status, Status::Matched).then_some(1.0),
+            approved_png_regenerated: false,
+            digest_expected: None,
+            digest_actual: String::new(),
+            actual_frame: actual.frame_json.clone(),
+            actual_png: actual.png.clone(),
+            expected_frame: approved.frame_json.clone(),
+            expected_png: approved.png.exists().then_some(approved.png.clone()),
+            expected_png_bytes: None,
+            diff_png: diff,
+            note: String::new(),
+        })
+    }
+}
+
+fn disk_status(approved: &ArtifactPaths, actual: &ArtifactPaths) -> Result<Status, SnapshotError> {
+    let some = |p: &Path| read_optional(p);
+    if some(&approved.ansi)?.is_none()
+        || some(&approved.txt)?.is_none()
+        || some(&approved.png)?.is_none()
+        || some(&approved.html)?.is_none()
+    {
+        return Ok(Status::MissingApproval);
+    }
+    if some(&approved.ansi)? != some(&actual.ansi)? || some(&approved.txt)? != some(&actual.txt)? {
+        return Ok(Status::CellsDiffer);
+    }
+    if some(&approved.html)? != some(&actual.html)? || some(&approved.png)? != some(&actual.png)? {
+        return Ok(Status::PixelsDiffer);
+    }
+    Ok(Status::Matched)
 }
 
 /// Diff PNG path of one scenario under the diff root (`<name>.png`).

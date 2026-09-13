@@ -533,11 +533,9 @@ impl Store {
         Ok(())
     }
 
-    /// Assemble one report row from a check outcome: reads the actual
-    /// artifacts and base64-embeds the PNGs. The expected panel uses
-    /// [`CompareOutcome::expected_png_bytes`] — the exact image the pixel
-    /// gate compared against — so it renders even when the approved PNG was
-    /// regenerated in memory rather than read from disk.
+    /// Assemble one report row from a check outcome. The HTML report links
+    /// PNGs on disk (no base64). Regenerated expected images with no disk
+    /// path are written next to the report under `report-media/`.
     pub fn report_entry(
         &self,
         outcome: &CompareOutcome,
@@ -593,41 +591,15 @@ impl Store {
     }
 }
 
-/// Assemble one report row from a check outcome: reads the actual artifacts
-/// and base64-embeds the PNGs. Free-function form of [`Store::report_entry`]
-/// so non-classic stores (e.g. [`crate::grouped::GroupedStore`]) can build
-/// rows for [`write_report_at`] without a [`Store`].
+/// Assemble one report row from a check outcome. Free-function form of
+/// [`Store::report_entry`] so non-classic stores can build rows without a
+/// [`Store`]. Does not read PNG bytes.
 pub fn report_entry(
     outcome: &CompareOutcome,
     profile: &Profile,
 ) -> Result<ReportEntry, SnapshotError> {
-    use base64::Engine;
-    let b64 = &base64::engine::general_purpose::STANDARD;
-    let actual_png = std::fs::read(&outcome.actual_png).map_err(|e| {
-        SnapshotError(format!(
-            "cannot read actual PNG {}: {e}",
-            outcome.actual_png.display()
-        ))
-    })?;
-    let actual_compact = std::fs::read_to_string(&outcome.actual_frame).map_err(|e| {
-        SnapshotError(format!(
-            "cannot read actual frame {}: {e}",
-            outcome.actual_frame.display()
-        ))
-    })?;
-    let actual_frame = Frame::from_json(&actual_compact)?;
     Ok(ReportEntry {
         outcome: outcome.clone(),
-        expected_png_b64: outcome.expected_png_bytes.as_ref().map(|b| b64.encode(b)),
-        actual_png_b64: b64.encode(&actual_png),
-        diff_png_b64: outcome
-            .diff_png
-            .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
-            .map(|b| b64.encode(&b)),
-        expected_frame_json: std::fs::read_to_string(&outcome.expected_frame).ok(),
-        actual_frame_json: actual_frame.to_json_pretty(),
-        actual_frame_compact: actual_compact,
         profile_desc: profile.name.clone(),
         font_sha256: profile.font_sha256.clone(),
     })
@@ -651,17 +623,10 @@ impl StoreReport {
     }
 }
 
-/// One row of the portable HTML report.
+/// One row of the review HTML report. Images are files on disk; the HTML
+/// only stores relative `href`s so hundreds of captures stay browser-usable.
 pub struct ReportEntry {
     pub outcome: CompareOutcome,
-    pub expected_png_b64: Option<String>,
-    pub actual_png_b64: String,
-    pub diff_png_b64: Option<String>,
-    pub expected_frame_json: Option<String>,
-    /// Human-readable pretty JSON for the report `<pre>`.
-    pub actual_frame_json: String,
-    /// Compact canonical JSON embedded for lossless re-import.
-    pub actual_frame_compact: String,
     pub profile_desc: String,
     pub font_sha256: String,
 }
@@ -679,9 +644,8 @@ pub fn json_for_script(json: &str) -> String {
     json.replace('<', "\\u003c")
 }
 
-/// Write a portable single-file report: authoritative PNGs embedded as
-/// base64 (no per-viewer font dependence), frame JSON embedded for lossless
-/// re-import, cell diagnostics as a table.
+/// Write a review index: PNGs linked from disk (never base64-embedded),
+/// failed captures first, frame JSON linked not inlined.
 pub fn write_report(
     store: &Store,
     title: &str,
@@ -698,31 +662,67 @@ pub fn write_report_at(
     title: &str,
     entries: &[ReportEntry],
 ) -> Result<PathBuf, SnapshotError> {
-    let mut body = String::new();
-    for e in entries {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            SnapshotError(format!("cannot create {}: {e}", parent.display()))
+        })?;
+    }
+    let report_dir = path.parent().unwrap_or(Path::new("."));
+    let failed_n = entries
+        .iter()
+        .filter(|e| !e.outcome.status.matched())
+        .count();
+    let mut ordered: Vec<&ReportEntry> = Vec::with_capacity(entries.len());
+    ordered.extend(entries.iter().filter(|e| !e.outcome.status.matched()));
+    ordered.extend(entries.iter().filter(|e| e.outcome.status.matched()));
+
+    let mut body = format!(
+        "<p>{} captures · {} matched · {} failed</p>\n",
+        entries.len(),
+        entries.len() - failed_n,
+        failed_n
+    );
+    for e in ordered {
         let o = &e.outcome;
         body.push_str(&format!(
-            "<section><h2>{} — {}</h2>\n",
+            "<section id=\"{}\"><h2>{} — {}</h2>\n",
+            esc_attr(&o.name),
             esc_html(&o.name),
             o.status.as_str()
         ));
         body.push_str("<div class=\"imgs\">");
-        if let Some(b) = &e.expected_png_b64 {
+        let expected_src = match &o.expected_png {
+            Some(p) if p.exists() => Some(rel_href(report_dir, p)),
+            _ => match &o.expected_png_bytes {
+                Some(bytes) => Some(rel_href(
+                    report_dir,
+                    &write_report_sidecar(report_dir, &o.name, "expected", bytes)?,
+                )),
+                None => None,
+            },
+        };
+        if let Some(src) = expected_src {
             body.push_str(&format!(
-                "<figure><figcaption>expected</figcaption><img src=\"data:image/png;base64,{b}\" alt=\"expected\"></figure>"
+                "<figure><figcaption>expected</figcaption><img src=\"{src}\" alt=\"expected {}\"></figure>",
+                esc_attr(&o.name)
             ));
         } else {
             body.push_str(
                 "<figure><figcaption>expected</figcaption><p>missing approval</p></figure>",
             );
         }
-        body.push_str(&format!(
-            "<figure><figcaption>actual</figcaption><img src=\"data:image/png;base64,{}\" alt=\"actual\"></figure>",
-            e.actual_png_b64
-        ));
-        if let Some(b) = &e.diff_png_b64 {
+        if o.actual_png.exists() {
+            let src = rel_href(report_dir, &o.actual_png);
             body.push_str(&format!(
-                "<figure><figcaption>diff</figcaption><img src=\"data:image/png;base64,{b}\" alt=\"diff\"></figure>"
+                "<figure><figcaption>actual</figcaption><img src=\"{src}\" alt=\"actual {}\"></figure>",
+                esc_attr(&o.name)
+            ));
+        }
+        if let Some(p) = o.diff_png.as_ref().filter(|p| p.exists()) {
+            let src = rel_href(report_dir, p);
+            body.push_str(&format!(
+                "<figure><figcaption>diff</figcaption><img src=\"{src}\" alt=\"diff {}\"></figure>",
+                esc_attr(&o.name)
             ));
         }
         body.push_str("</div>");
@@ -745,16 +745,16 @@ pub fn write_report_at(
         if let Some(s) = o.pixel_score {
             body.push_str(&format!("<p>pixel similarity: {s:.6}</p>"));
         }
-        body.push_str(&format!(
-            "<details><summary>actual frame.json</summary><script type=\"application/json\" id=\"actual-{}\">{}</script><pre>{}</pre></details>",
-            esc_html(&o.name),
-            json_for_script(&e.actual_frame_compact),
-            esc_html(&e.actual_frame_json)
-        ));
-        if let Some(j) = &e.expected_frame_json {
+        if o.actual_frame.exists() {
             body.push_str(&format!(
-                "<details><summary>expected frame.json</summary><pre>{}</pre></details>",
-                esc_html(j)
+                "<p><a href=\"{}\">actual frame.json</a></p>",
+                rel_href(report_dir, &o.actual_frame)
+            ));
+        }
+        if o.expected_frame.exists() {
+            body.push_str(&format!(
+                "<p><a href=\"{}\">expected frame.json</a></p>",
+                rel_href(report_dir, &o.expected_frame)
             ));
         }
         body.push_str("</section>");
@@ -770,10 +770,52 @@ pub fn write_report_at(
         })
         .unwrap_or_default();
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title>\n<style>body{{font-family:system-ui,sans-serif;background:#141414;color:#eee;margin:24px}}section{{border:1px solid #444;margin:16px 0;padding:16px}}img{{max-width:100%;image-rendering:pixelated}}table{{border-collapse:collapse}}td,th{{border:1px solid #555;padding:2px 8px;font-family:monospace}}pre{{white-space:pre-wrap}}</style></head><body><h1>{}</h1>{profile_line}{body}</body></html>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title>\n<style>body{{font-family:system-ui,sans-serif;background:#141414;color:#eee;margin:24px}}section{{border:1px solid #444;margin:16px 0;padding:16px}}img{{max-width:100%;image-rendering:pixelated}}table{{border-collapse:collapse}}td,th{{border:1px solid #555;padding:2px 8px;font-family:monospace}}</style></head><body><h1>{}</h1>{profile_line}{body}</body></html>",
         esc_html(title),
         esc_html(title)
     );
     write_atomic(path, html.as_bytes())?;
     Ok(path.to_path_buf())
+}
+
+fn esc_attr(s: &str) -> String {
+    esc_html(s).replace('"', "&quot;")
+}
+
+fn rel_href(from_dir: &Path, to: &Path) -> String {
+    let from = from_dir.components().collect::<Vec<_>>();
+    let to_c = to.components().collect::<Vec<_>>();
+    let mut i = 0;
+    while i < from.len() && i < to_c.len() && from[i] == to_c[i] {
+        i += 1;
+    }
+    let mut out = PathBuf::new();
+    for _ in i..from.len() {
+        out.push("..");
+    }
+    for c in &to_c[i..] {
+        out.push(*c);
+    }
+    if out.as_os_str().is_empty() {
+        return to
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| to.display().to_string());
+    }
+    out.to_string_lossy().replace('\\', "/")
+}
+
+fn write_report_sidecar(
+    report_dir: &Path,
+    name: &str,
+    kind: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, SnapshotError> {
+    let dir = report_dir.join("report-media");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| SnapshotError(format!("cannot create {}: {e}", dir.display())))?;
+    let safe = name.replace('/', "__");
+    let path = dir.join(format!("{safe}-{kind}.png"));
+    write_atomic(&path, bytes)?;
+    Ok(path)
 }

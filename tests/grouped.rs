@@ -336,6 +336,10 @@ fn report_reverifies_nested_actuals_outside_approved_tree() {
     let html = std::fs::read_to_string(&report.path).unwrap();
     assert!(html.contains("suite/one — matched"), "{html}");
     assert!(html.contains("suite/nested/two — missing-approval"), "{html}");
+    assert!(
+        !html.contains("data:image/png;base64,"),
+        "suite report must not embed PNGs"
+    );
     // The approved tree is still exactly the four artifacts of `suite/one`.
     assert_eq!(
         tree_files(st.approved_root()),

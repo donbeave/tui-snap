@@ -177,34 +177,20 @@ fn concurrent_different_names_are_safe() {
 }
 
 #[test]
-fn report_embeds_images_and_frame_json() {
+fn report_links_png_files_not_base64() {
     let (_dir, st) = tmp_store("report");
     let frame = frame_with("reported");
     let outcome = st
         .check("home", &frame, &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
-    let actual_png = std::fs::read(&outcome.actual_png).unwrap();
-    let actual_json = std::fs::read_to_string(&outcome.actual_frame).unwrap();
-    let entry = tuisnap::snapshot::ReportEntry {
-        outcome,
-        expected_png_b64: None,
-        actual_png_b64: base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &actual_png,
-        ),
-        diff_png_b64: None,
-        expected_frame_json: None,
-        actual_frame_json: tuisnap::Frame::from_json(&actual_json)
-            .unwrap()
-            .to_json_pretty(),
-        actual_frame_compact: actual_json.clone(),
-        profile_desc: profile().name.clone(),
-        font_sha256: profile().font_sha256.clone(),
-    };
+    let entry = tuisnap::snapshot::report_entry(&outcome, &profile()).unwrap();
     let report = tuisnap::snapshot::write_report(&st, "test report", &[entry]).unwrap();
     let html = std::fs::read_to_string(&report).unwrap();
-    assert!(html.contains("data:image/png;base64,"));
-    assert!(html.contains("application/json"));
+    assert!(
+        !html.contains("data:image/png;base64,"),
+        "report must link files, not embed PNG bytes"
+    );
+    assert!(html.contains(".png"), "{html}");
     assert!(html.contains("tuisnap-default"));
     let _ = PathBuf::from("x");
 }
@@ -318,20 +304,11 @@ fn report_shows_expected_panel_when_approved_png_missing_on_disk() {
         *bytes, actual_bytes,
         "same frame through one renderer: regenerated expected == actual"
     );
-    // report_entry embeds the gated image instead of showing the caption.
     let entry = st.report_entry(&outcome, &profile()).unwrap();
-    let b64 = entry
-        .expected_png_b64
-        .clone()
-        .expect("expected panel populated");
-    use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .unwrap();
-    assert_eq!(decoded, actual_bytes);
     let report = tuisnap::snapshot::write_report(&st, "t", &[entry]).unwrap();
     let html = std::fs::read_to_string(report).unwrap();
     assert!(!html.contains("missing approval"), "{html}");
+    assert!(html.contains("report-media") || html.contains(".png"), "{html}");
 }
 
 #[test]
@@ -395,26 +372,15 @@ fn script_embed_round_trips_hostile_symbols() {
     let outcome = st
         .check("home", &frame, &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
-    let entry = tuisnap::snapshot::ReportEntry {
-        outcome,
-        expected_png_b64: None,
-        actual_png_b64: String::new(),
-        diff_png_b64: None,
-        expected_frame_json: None,
-        actual_frame_json: frame.to_json_pretty(),
-        actual_frame_compact: frame.to_json(),
-        profile_desc: profile().name.clone(),
-        font_sha256: profile().font_sha256.clone(),
-    };
+    let entry = tuisnap::snapshot::report_entry(&outcome, &profile()).unwrap();
     let report = tuisnap::snapshot::write_report(&st, "t", &[entry]).unwrap();
     let html = std::fs::read_to_string(&report).unwrap();
-    // Exactly one literal closer: the embed's own. The symbol's `<` must
-    // have been escaped, never emitted raw into the script element.
-    assert_eq!(html.matches("</script>").count(), 1);
-    // Extract the embedded script JSON and re-import it losslessly.
-    let start = html.find("<script type=\"application/json\"").unwrap();
-    let start = html[start..].find('>').unwrap() + start + 1;
-    let end = html[start..].find("</script>").unwrap() + start;
-    let back = tuisnap::Frame::from_json(&html[start..end]).unwrap();
+    // Index does not inline frame JSON, so a cell `<` cannot break HTML.
+    assert!(!html.contains("<script type=\"application/json\""));
+    assert_eq!(html.matches("</script>").count(), 0);
+    let back = tuisnap::Frame::from_json(
+        &std::fs::read_to_string(&outcome.actual_frame).unwrap(),
+    )
+    .unwrap();
     assert_eq!(back.digest(), frame.digest());
 }
