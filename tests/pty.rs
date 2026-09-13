@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use std::time::Duration;
-use tuisnap::pty::{PtyOptions, Session};
+use tuisnap::pty::{self, PtyOptions, Session};
 
 fn opts() -> PtyOptions {
     PtyOptions {
@@ -166,6 +166,33 @@ fn mouse_wrappers_reach_the_engine() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("mouse tracking"), "{err}");
+}
+
+#[test]
+fn run_once_needle_boot_skips_idle_on_live_stream() {
+    // OSC 0 (window title) keeps the byte stream busy without changing
+    // cells, so wait_idle(200ms) would never hold and wait_stable can.
+    let argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf ready; while true; do printf '\\033]0;x\\007'; sleep 0.05; done".into(),
+    ];
+    let opts = PtyOptions {
+        timeout: Duration::from_secs(2),
+        ..opts()
+    };
+    let frame = pty::run_once(
+        &argv,
+        &opts,
+        &["wait:ready".into()],
+        Duration::from_millis(80),
+    )
+    .expect("needle boot must not wait_idle a live stream");
+    assert!(
+        frame.text().contains("ready"),
+        "needle boot frame:\n{}",
+        frame.text()
+    );
 }
 
 #[test]

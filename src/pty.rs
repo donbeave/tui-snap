@@ -441,6 +441,12 @@ fn parse_chord(name: &str) -> Option<termlens::Chord> {
 /// Steps: `type:<text>`, `sleep:<ms>`, `wait:<needle>`, anything else is a
 /// [`Session::send_key`] name. Every wait fails the run on timeout — a
 /// scenario never continues past a screen that never appeared.
+///
+/// Boot: if `sends` starts with `wait:<needle>`, that needle is readiness
+/// and the 200 ms quiet window is skipped. Live clocks and reduced-motion
+/// ticks keep emitting bytes after the prompt is on screen, so
+/// [`Session::wait_idle`] never holds. Otherwise wait 200 ms of silence
+/// (apps whose boot is a burst then idle).
 pub fn run_once(
     argv: &[String],
     opts: &PtyOptions,
@@ -448,7 +454,19 @@ pub fn run_once(
     settle: Duration,
 ) -> Result<Frame> {
     let mut s = Session::spawn(argv, opts)?;
-    s.wait_idle(Duration::from_millis(200))?;
+    let rest = if let Some(needle) = sends.first().and_then(|st| st.strip_prefix("wait:")) {
+        s.wait_for_text(needle)?;
+        &sends[1..]
+    } else {
+        s.wait_idle(Duration::from_millis(200))?;
+        sends
+    };
+    apply_sends(&mut s, rest)?;
+    s.wait_stable(settle)?;
+    Ok(s.snapshot())
+}
+
+fn apply_sends(s: &mut Session, sends: &[String]) -> Result<()> {
     for step in sends {
         if let Some(ms) = step.strip_prefix("sleep:") {
             let ms: u64 = ms.parse().context("sleep:<ms>")?;
@@ -463,6 +481,5 @@ pub fn run_once(
             std::thread::sleep(Duration::from_millis(120));
         }
     }
-    s.wait_stable(settle)?;
-    Ok(s.snapshot())
+    Ok(())
 }
