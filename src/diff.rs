@@ -44,6 +44,43 @@ fn decode_png(bytes: &[u8], label: &str) -> Result<RgbImage, DiffError> {
 
 /// Compare decoded pixels. Never compares compressed bytes.
 pub fn compare_png(expected_png: &[u8], actual_png: &[u8]) -> Result<PixelVerdict, DiffError> {
+    compare_png_with_flags(expected_png, actual_png, false)
+}
+
+/// Like [`compare_png`], but when `ansi_matched` is true the cell-exact gate
+/// already passed — skip the expensive hybrid metric and treat pixels as
+/// matching. Raw byte identity is checked first in all cases.
+pub fn compare_png_with_flags(
+    expected_png: &[u8],
+    actual_png: &[u8],
+    ansi_matched: bool,
+) -> Result<PixelVerdict, DiffError> {
+    if expected_png == actual_png {
+        let expected = decode_png(expected_png, "expected")?;
+        let w = expected.width();
+        let h = expected.height();
+        return Ok(PixelVerdict {
+            dims_equal: true,
+            expected_dims: (w, h),
+            actual_dims: (w, h),
+            score: 1.0,
+            diff_png: Vec::new(),
+        });
+    }
+    if ansi_matched {
+        let expected = decode_png(expected_png, "expected")?;
+        let actual = decode_png(actual_png, "actual")?;
+        let expected_dims = (expected.width(), expected.height());
+        let actual_dims = (actual.width(), actual.height());
+        let dims_equal = expected_dims == actual_dims;
+        return Ok(PixelVerdict {
+            dims_equal,
+            expected_dims,
+            actual_dims,
+            score: if dims_equal { 1.0 } else { 0.0 },
+            diff_png: Vec::new(),
+        });
+    }
     let expected = decode_png(expected_png, "expected")?;
     let actual = decode_png(actual_png, "actual")?;
     let expected_dims = (expected.width(), expected.height());

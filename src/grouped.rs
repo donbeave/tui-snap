@@ -52,7 +52,7 @@
 use crate::diff;
 use crate::frame::Frame;
 use crate::profile::Profile;
-use crate::render::Renderer;
+use crate::render::{self, Renderer};
 use crate::snapshot::{
     report_entry, write_atomic, write_report_at, CompareOutcome, SnapshotError, Status, StoreReport,
 };
@@ -156,6 +156,14 @@ fn first_difference(approved: &[u8], actual: &[u8]) -> String {
         approved.len(),
         actual.len()
     )
+}
+
+/// Options for [`GroupedStore::check_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GroupedCheckOptions {
+    /// When true, always rasterize PNG/HTML even if the ansi/txt gates pass.
+    /// Default tiered mode skips expensive renders when cell gates match.
+    pub full_render: bool,
 }
 
 /// Outcome of one grouped [`GroupedStore::check_with`]. The shared
@@ -308,24 +316,37 @@ impl GroupedStore {
         actual: &Frame,
         pixel_threshold: f64,
     ) -> Result<GroupedOutcome, SnapshotError> {
+        self.check_with_options(
+            renderer,
+            name,
+            actual,
+            pixel_threshold,
+            &GroupedCheckOptions::default(),
+        )
+    }
+
+    /// [`Self::check_with`] with explicit options (e.g. force full PNG/HTML
+    /// render even when ansi/txt gates pass).
+    pub fn check_with_options(
+        &self,
+        renderer: &mut Renderer,
+        name: &str,
+        actual: &Frame,
+        pixel_threshold: f64,
+        options: &GroupedCheckOptions,
+    ) -> Result<GroupedOutcome, SnapshotError> {
         validate_name(name)?;
         actual.validate().map_err(SnapshotError::from)?;
-        let artifacts = renderer
-            .render_artifacts(actual, name)
-            .map_err(SnapshotError::from)?;
+
+        let actual_ansi = render::ansi_dump(actual);
+        let actual_txt = actual.text();
 
         let actual_paths = artifact_paths(&self.actual_root, name);
         let approved_paths = artifact_paths(&self.approved_root, name);
-        // Actuals first: a failing gate still leaves reviewable evidence.
-        write_atomic(&actual_paths.ansi, artifacts.ansi.as_bytes())?;
-        write_atomic(&actual_paths.txt, artifacts.txt.as_bytes())?;
-        write_atomic(&actual_paths.png, &artifacts.png)?;
-        write_atomic(&actual_paths.html, artifacts.html.as_bytes())?;
+        // Cheap actuals first: a failing gate still leaves reviewable evidence.
+        write_atomic(&actual_paths.ansi, actual_ansi.as_bytes())?;
+        write_atomic(&actual_paths.txt, actual_txt.as_bytes())?;
         write_atomic(&actual_paths.frame_json, actual.to_json().as_bytes())?;
-        write_atomic(
-            &fidelity_sidecar(&actual_paths.png),
-            artifacts.fidelity.to_json().as_bytes(),
-        )?;
 
         let outcome = CompareOutcome {
             name: name.to_string(),
@@ -375,6 +396,15 @@ impl GroupedStore {
             missing.push(".png");
         }
         if !missing.is_empty() {
+            let artifacts = renderer
+                .render_artifacts(actual, name)
+                .map_err(SnapshotError::from)?;
+            write_atomic(&grouped.actual.png, &artifacts.png)?;
+            write_atomic(&grouped.actual.html, artifacts.html.as_bytes())?;
+            write_atomic(
+                &fidelity_sidecar(&grouped.actual.png),
+                artifacts.fidelity.to_json().as_bytes(),
+            )?;
             outcome.note = format!(
                 "missing approved artifact(s) for `{name}`: {}",
                 missing.join(" ")
@@ -393,18 +423,18 @@ impl GroupedStore {
         let mut notes: Vec<String> = Vec::new();
 
         // ANSI byte gate: the cell-exact comparison (symbol+fg+bg+mods).
-        let ansi_equal = approved_ansi == artifacts.ansi.as_bytes();
+        let ansi_equal = approved_ansi.as_slice() == actual_ansi.as_bytes();
         grouped.ansi_match = Some(ansi_equal);
         if !ansi_equal {
             outcome.status = Status::CellsDiffer;
             notes.push(format!(
                 "ansi differs (cell-exact gate): {}",
-                first_difference(&approved_ansi, artifacts.ansi.as_bytes())
+                first_difference(&approved_ansi, actual_ansi.as_bytes())
             ));
         }
 
         // TXT byte gate: content only (style-only changes keep txt equal).
-        let txt_equal = approved_txt == artifacts.txt.as_bytes();
+        let txt_equal = approved_txt.as_slice() == actual_txt.as_bytes();
         grouped.txt_match = Some(txt_equal);
         if !txt_equal {
             if matches!(outcome.status, Status::MissingApproval) {
@@ -412,13 +442,34 @@ impl GroupedStore {
             }
             notes.push(format!(
                 "txt differs: {}",
-                first_difference(&approved_txt, artifacts.txt.as_bytes())
+                first_difference(&approved_txt, actual_txt.as_bytes())
             ));
         }
 
+        let cell_gates_match = ansi_equal && txt_equal;
+        let need_full_render = options.full_render || !cell_gates_match;
+
+        let (actual_html_bytes, actual_png_bytes) = if need_full_render {
+            let artifacts = renderer
+                .render_artifacts(actual, name)
+                .map_err(SnapshotError::from)?;
+            write_atomic(&grouped.actual.png, &artifacts.png)?;
+            write_atomic(&grouped.actual.html, artifacts.html.as_bytes())?;
+            write_atomic(
+                &fidelity_sidecar(&grouped.actual.png),
+                artifacts.fidelity.to_json().as_bytes(),
+            )?;
+            (artifacts.html.into_bytes(), artifacts.png)
+        } else {
+            // Tiered fast path: cell gates passed — reuse approved render bytes.
+            write_atomic(&grouped.actual.png, &approved_png)?;
+            write_atomic(&grouped.actual.html, &approved_html)?;
+            (approved_html.clone(), approved_png.clone())
+        };
+
         // HTML byte gate: identical cells with a changed renderer/font fail
         // here — a render-level event, reported as PixelsDiffer.
-        let html_equal = approved_html == artifacts.html.as_bytes();
+        let html_equal = approved_html == actual_html_bytes;
         grouped.html_match = Some(html_equal);
         if !html_equal {
             if matches!(outcome.status, Status::MissingApproval) {
@@ -426,13 +477,17 @@ impl GroupedStore {
             }
             notes.push(format!(
                 "html differs (render-level gate): {}",
-                first_difference(&approved_html, artifacts.html.as_bytes())
+                first_difference(&approved_html, &actual_html_bytes)
             ));
         }
 
         // PNG pixel gate: decoded pixels, same threshold semantics as the
         // classic store. A corrupt approved PNG is an explicit error.
-        let verdict = diff::compare_png(&approved_png, &artifacts.png)?;
+        let verdict = diff::compare_png_with_flags(
+            &approved_png,
+            &actual_png_bytes,
+            cell_gates_match && !options.full_render,
+        )?;
         if !verdict.dims_equal {
             outcome.status = Status::DimensionMismatch;
             notes.push(format!(

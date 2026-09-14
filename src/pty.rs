@@ -46,6 +46,10 @@ pub struct PtyOptions {
     /// set. Implemented as clear-then-re-add inside termlens, so semantics
     /// match `std::process::Command::env_remove` for every other variable.
     pub env_remove: Vec<String>,
+    /// Pause after each key/text step in [`run_once`] (not after `sleep:` or
+    /// `wait:`). Default 120 ms for app compat; set to [`Duration::ZERO`]
+    /// for fast scripted captures.
+    pub input_pace: Duration,
 }
 
 impl Default for PtyOptions {
@@ -57,6 +61,7 @@ impl Default for PtyOptions {
             scrollback: 1000,
             env: Vec::new(),
             env_remove: Vec::new(),
+            input_pace: Duration::from_millis(120),
         }
     }
 }
@@ -461,12 +466,11 @@ pub fn run_once(
         s.wait_idle(Duration::from_millis(200))?;
         sends
     };
-    apply_sends(&mut s, rest)?;
-    s.wait_stable(settle)?;
-    Ok(s.snapshot())
+    apply_sends(&mut s, rest, opts.input_pace)?;
+    s.wait_stable(settle)
 }
 
-fn apply_sends(s: &mut Session, sends: &[String]) -> Result<()> {
+fn apply_sends(s: &mut Session, sends: &[String], pace: Duration) -> Result<()> {
     for step in sends {
         if let Some(ms) = step.strip_prefix("sleep:") {
             let ms: u64 = ms.parse().context("sleep:<ms>")?;
@@ -475,10 +479,14 @@ fn apply_sends(s: &mut Session, sends: &[String]) -> Result<()> {
             s.wait_for_text(needle)?;
         } else if let Some(text) = step.strip_prefix("type:") {
             s.type_text(text)?;
-            std::thread::sleep(Duration::from_millis(120));
+            if !pace.is_zero() {
+                std::thread::sleep(pace);
+            }
         } else {
             s.send_key(step)?;
-            std::thread::sleep(Duration::from_millis(120));
+            if !pace.is_zero() {
+                std::thread::sleep(pace);
+            }
         }
     }
     Ok(())

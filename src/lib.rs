@@ -37,7 +37,7 @@ pub mod pty;
 pub use termlens;
 
 pub use frame::{Cell, Color, Cursor, CursorStyle, Frame, FrameError, Mods, Provenance, Rgb};
-pub use grouped::{ArtifactPaths, GroupedOutcome, GroupedStore, InvalidName};
+pub use grouped::{ArtifactPaths, GroupedCheckOptions, GroupedOutcome, GroupedStore, InvalidName};
 pub use profile::{
     FallbackFace, FontFaces, Profile, VENDORED_CJK_FONT, VENDORED_CJK_FONT_SHA256,
     VENDORED_FACES, VENDORED_FALLBACK_FACES, VENDORED_FONT, VENDORED_FONT_BOLD,

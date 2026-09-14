@@ -470,7 +470,9 @@ impl Store {
         if png_on_disk {
             outcome.expected_png = Some(approved_png_path);
         }
-        let verdict = diff::compare_png(&approved_png_bytes, actual_png_bytes)?;
+        let cells_match = matches!(outcome.status, Status::MissingApproval);
+        let verdict =
+            diff::compare_png_with_flags(&approved_png_bytes, actual_png_bytes, cells_match)?;
         outcome.expected_png_bytes = Some(approved_png_bytes);
         if !verdict.dims_equal {
             outcome.status = Status::DimensionMismatch;
