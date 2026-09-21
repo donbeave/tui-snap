@@ -71,11 +71,7 @@ fn missing_accept_match_round_trip_nested_name() {
     assert!(o1.actual.png.exists());
     assert!(o1.actual.html.exists());
     assert!(o1.actual.frame_json.exists());
-    assert!(o1
-        .actual
-        .png
-        .with_extension("png.fidelity.json")
-        .exists());
+    assert!(o1.actual.png.with_extension("png.fidelity.json").exists());
     // Nothing approved yet (fail-closed).
     assert!(!o1.approved.ansi.exists());
 
@@ -113,7 +109,10 @@ fn ansi_and_txt_and_html_are_byte_deterministic() {
     p2.created_unix = 1_700_000_000;
     let a = tuisnap::ratatui::widget_frame(Paragraph::new("deterministic ╔═╗"), 30, 6, prov());
     let b = tuisnap::ratatui::widget_frame(Paragraph::new("deterministic ╔═╗"), 30, 6, p2);
-    assert_eq!(tuisnap::render::ansi_dump(&a), tuisnap::render::ansi_dump(&b));
+    assert_eq!(
+        tuisnap::render::ansi_dump(&a),
+        tuisnap::render::ansi_dump(&b)
+    );
     assert_eq!(a.text(), b.text());
     let ha = renderer.render_html(&a, "t").unwrap();
     let hb = renderer.render_html(&b, "t").unwrap();
@@ -167,11 +166,23 @@ fn name_validation_rejects_unsafe_names() {
 fn cell_change_fails_ansi_gate_as_cells_differ() {
     let name = "flows/checkout/step1";
     let (_dir, st) = tmp_store("cells");
-    st.check(name, &frame_with("before"), &profile(), &VENDORED_FACES, 1.0)
-        .unwrap();
+    st.check(
+        name,
+        &frame_with("before"),
+        &profile(),
+        &VENDORED_FACES,
+        1.0,
+    )
+    .unwrap();
     st.accept(name).unwrap();
     let outcome = st
-        .check(name, &frame_with("after!"), &profile(), &VENDORED_FACES, 1.0)
+        .check(
+            name,
+            &frame_with("after!"),
+            &profile(),
+            &VENDORED_FACES,
+            1.0,
+        )
         .unwrap();
     assert_eq!(outcome.status(), Status::CellsDiffer);
     assert_eq!(outcome.ansi_match, Some(false));
@@ -190,8 +201,14 @@ fn cell_change_fails_ansi_gate_as_cells_differ() {
 fn style_only_change_keeps_txt_equal() {
     let name = "flows/checkout/step2";
     let (_dir, st) = tmp_store("style");
-    st.check(name, &frame_with("same text"), &profile(), &VENDORED_FACES, 1.0)
-        .unwrap();
+    st.check(
+        name,
+        &frame_with("same text"),
+        &profile(),
+        &VENDORED_FACES,
+        1.0,
+    )
+    .unwrap();
     st.accept(name).unwrap();
     let mut styled = frame_with("same text");
     styled.cells[0].mods.bold = true;
@@ -221,9 +238,7 @@ fn png_pixel_gate_honors_threshold() {
     std::fs::write(st.approved_root().join(format!("{name}.png")), &other_png).unwrap();
 
     let mut renderer = profile().renderer(&VENDORED_FACES).unwrap();
-    let opts = GroupedCheckOptions {
-        full_render: true,
-    };
+    let opts = GroupedCheckOptions { full_render: true };
     let strict = st
         .check_with_options(&mut renderer, name, &frame, 1.0, &opts)
         .unwrap();
@@ -254,7 +269,11 @@ fn missing_single_artifact_fails_closed() {
         .check(name, &frame_with("x"), &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
     assert_eq!(outcome.status(), Status::MissingApproval);
-    assert!(outcome.outcome.note.contains(".txt"), "{}", outcome.outcome.note);
+    assert!(
+        outcome.outcome.note.contains(".txt"),
+        "{}",
+        outcome.outcome.note
+    );
 }
 
 #[test]
@@ -272,9 +291,7 @@ fn corrupt_approved_png_is_an_explicit_error() {
             name,
             &frame_with("x"),
             1.0,
-            &GroupedCheckOptions {
-                full_render: true,
-            },
+            &GroupedCheckOptions { full_render: true },
         )
         .unwrap_err()
         .to_string();
@@ -307,7 +324,13 @@ fn accept_all_walks_nested_names_recursively() {
     assert_eq!(st.approved_names().unwrap(), listed);
     for name in &names {
         let outcome = st
-            .check(name, &frame_with("placeholder"), &profile(), &VENDORED_FACES, 1.0)
+            .check(
+                name,
+                &frame_with("placeholder"),
+                &profile(),
+                &VENDORED_FACES,
+                1.0,
+            )
             .unwrap();
         assert_eq!(outcome.status(), Status::CellsDiffer, "{name} was approved");
     }
@@ -348,7 +371,10 @@ fn report_reverifies_nested_actuals_outside_approved_tree() {
     assert!(!report.path.starts_with(st.approved_root()));
     let html = std::fs::read_to_string(&report.path).unwrap();
     assert!(html.contains("suite/one — matched"), "{html}");
-    assert!(html.contains("suite/nested/two — missing-approval"), "{html}");
+    assert!(
+        html.contains("suite/nested/two — missing-approval"),
+        "{html}"
+    );
     assert!(
         !html.contains("data:image/png;base64,"),
         "suite report must not embed PNGs"
@@ -390,15 +416,28 @@ fn custom_actual_and_diff_roots_are_honored() {
     let outcome = st
         .check(name, &frame_with("roots"), &profile(), &VENDORED_FACES, 1.0)
         .unwrap();
-    assert!(outcome.actual.ansi.starts_with(dir.path().join("scratch/actual")));
+    assert!(outcome
+        .actual
+        .ansi
+        .starts_with(dir.path().join("scratch/actual")));
     assert_eq!(outcome.status(), Status::MissingApproval);
     st.accept(name).unwrap();
     assert!(approved.join(format!("{name}.ansi")).exists());
     let outcome = st
-        .check(name, &frame_with("changed"), &profile(), &VENDORED_FACES, 1.0)
+        .check(
+            name,
+            &frame_with("changed"),
+            &profile(),
+            &VENDORED_FACES,
+            1.0,
+        )
         .unwrap();
     let diff = outcome.outcome.diff_png.unwrap();
-    assert!(diff.starts_with(dir.path().join("scratch/diff")), "{}", diff.display());
+    assert!(
+        diff.starts_with(dir.path().join("scratch/diff")),
+        "{}",
+        diff.display()
+    );
 }
 
 #[test]
@@ -426,14 +465,10 @@ fn check_with_reuses_one_renderer_across_nested_checks() {
     let profile = profile();
     let mut renderer = profile.renderer(&VENDORED_FACES).unwrap();
     let frame = frame_with("cached grouped");
-    let o1 = st
-        .check_with(&mut renderer, "g/s", &frame, 1.0)
-        .unwrap();
+    let o1 = st.check_with(&mut renderer, "g/s", &frame, 1.0).unwrap();
     assert_eq!(o1.status(), Status::MissingApproval);
     st.accept("g/s").unwrap();
-    let o2 = st
-        .check_with(&mut renderer, "g/s", &frame, 1.0)
-        .unwrap();
+    let o2 = st.check_with(&mut renderer, "g/s", &frame, 1.0).unwrap();
     assert_eq!(o2.status(), Status::Matched);
     assert_eq!(o2.outcome.pixel_score, Some(1.0));
     o2.ensure_matched().unwrap();
@@ -444,12 +479,21 @@ fn html_artifact_is_a_standalone_colored_render() {
     let name = "docs/preview";
     let (_dir, st) = tmp_store("htmlview");
     let outcome = st
-        .check(name, &frame_with("standalone"), &profile(), &VENDORED_FACES, 1.0)
+        .check(
+            name,
+            &frame_with("standalone"),
+            &profile(),
+            &VENDORED_FACES,
+            1.0,
+        )
         .unwrap();
     let html = std::fs::read_to_string(&outcome.actual.html).unwrap();
     assert!(html.contains("<svg"), "{html}");
     assert!(html.contains("data:image/png;base64,"), "{html}");
-    assert!(html.contains("<script type=\"application/json\">"), "{html}");
+    assert!(
+        html.contains("<script type=\"application/json\">"),
+        "{html}"
+    );
     assert!(html.contains("<title>docs/preview</title>"), "{html}");
     let body = html.split("<body>").nth(1).unwrap();
     let img = body.find("<img ").expect("png img");

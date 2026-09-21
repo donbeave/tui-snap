@@ -115,11 +115,9 @@ fn env_set_and_remove_reach_the_child() {
     let base = run(&opts());
     assert!(base.contains("strip=1"), "{base}");
     // env_remove strips the inherited var; with_env sets a new one.
-    let cleaned = run(
-        &opts()
-            .without_env("TUISNAP_PTY_STRIP_ME")
-            .with_env("TUISNAP_PTY_SET_ME", "yes"),
-    );
+    let cleaned = run(&opts()
+        .without_env("TUISNAP_PTY_STRIP_ME")
+        .with_env("TUISNAP_PTY_SET_ME", "yes"));
     assert!(
         !cleaned.contains("strip=1"),
         "stripped var must be gone: {cleaned}"
