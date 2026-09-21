@@ -178,7 +178,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: main
-          DECLARED_RULESET_CONTEXTS: Policy,ci-required
+          DECLARED_RULESET_CONTEXTS: DCO,Policy,ci-required
         run: |
           set -euo pipefail
           stderr="$(mktemp)"

@@ -1,12 +1,11 @@
 schema = 2
 
 [generator]
-repository = "donbeave/tui-snap"
+repository = "tailrocks/tui-snap"
 revision = "be61acbbbfb71db6b51337e547e39de049d4fc15"
 
 # Public repo: GitHub-hosted singleton (no velnor lanes).
-# No external DCO declared: the DCO app has not posted on this repo
-# (runbook §2 guardrail — declaring an uncovered context fails Policy).
+# (donbeave/tui-snap is a redirect; the repo lives in tailrocks.)
 # vendor/ excluded by evidence: vendor/termlens is standalone (no
 # workspace membership, no lockfile), so `cargo --locked` run from
 # that dir fails; it still compiles as a path dependency of the root
@@ -25,3 +24,4 @@ runs_on = ["ubuntu-24.04"]
 
 [policy]
 ruleset_required_status_checks = ["ci-required", "Policy"]
+ruleset_external_status_checks = ["DCO"]
