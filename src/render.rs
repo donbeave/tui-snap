@@ -1131,16 +1131,8 @@ mod tests {
                 created_unix: 0,
             },
         );
-        let html = html_document(
-            &frame,
-            &Profile::default_profile(),
-            r#"x" onload="#,
-            b"",
-        );
-        assert!(
-            html.contains(r#"alt="x&quot; onload=""#),
-            "{html}"
-        );
+        let html = html_document(&frame, &Profile::default_profile(), r#"x" onload="#, b"");
+        assert!(html.contains(r#"alt="x&quot; onload=""#), "{html}");
         assert!(
             !html.contains(r#"alt="x" onload="#),
             "raw attribute breakout: {html}"

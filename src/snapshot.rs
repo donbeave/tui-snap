@@ -665,9 +665,8 @@ pub fn write_report_at(
     entries: &[ReportEntry],
 ) -> Result<PathBuf, SnapshotError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            SnapshotError(format!("cannot create {}: {e}", parent.display()))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| SnapshotError(format!("cannot create {}: {e}", parent.display())))?;
     }
     let report_dir = path.parent().unwrap_or(Path::new("."));
     let failed_n = entries

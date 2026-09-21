@@ -106,11 +106,10 @@ fn check_writes_fidelity_sidecar_next_to_actual_png() {
     assert!(json.contains("U+1F980"), "{json}");
     // Acceptance pairs the sidecar with the approved PNG.
     st.accept("home").unwrap();
-    let approved = st
-        .root()
-        .join("approved")
-        .join("home.png.fidelity.json");
-    assert!(std::fs::read_to_string(&approved).unwrap().contains("U+1F980"));
+    let approved = st.root().join("approved").join("home.png.fidelity.json");
+    assert!(std::fs::read_to_string(&approved)
+        .unwrap()
+        .contains("U+1F980"));
 }
 
 #[test]
@@ -308,17 +307,32 @@ fn report_shows_expected_panel_when_approved_png_missing_on_disk() {
     let report = tuisnap::snapshot::write_report(&st, "t", &[entry]).unwrap();
     let html = std::fs::read_to_string(report).unwrap();
     assert!(!html.contains("missing approval"), "{html}");
-    assert!(html.contains("report-media") || html.contains(".png"), "{html}");
+    assert!(
+        html.contains("report-media") || html.contains(".png"),
+        "{html}"
+    );
 }
 
 #[test]
 fn store_report_reverifies_actuals_and_rewrites_report_html() {
     let (_dir, st) = tmp_store("storereport");
-    st.check("home", &frame_with("alpha"), &profile(), &VENDORED_FACES, 1.0)
-        .unwrap();
+    st.check(
+        "home",
+        &frame_with("alpha"),
+        &profile(),
+        &VENDORED_FACES,
+        1.0,
+    )
+    .unwrap();
     st.accept("home").unwrap();
-    st.check("other", &frame_with("beta"), &profile(), &VENDORED_FACES, 1.0)
-        .unwrap();
+    st.check(
+        "other",
+        &frame_with("beta"),
+        &profile(),
+        &VENDORED_FACES,
+        1.0,
+    )
+    .unwrap();
     let report = st
         .report(&profile(), &VENDORED_FACES, 1.0, "suite report")
         .unwrap();
@@ -378,9 +392,7 @@ fn script_embed_round_trips_hostile_symbols() {
     // Index does not inline frame JSON, so a cell `<` cannot break HTML.
     assert!(!html.contains("<script type=\"application/json\""));
     assert_eq!(html.matches("</script>").count(), 0);
-    let back = tuisnap::Frame::from_json(
-        &std::fs::read_to_string(&outcome.actual_frame).unwrap(),
-    )
-    .unwrap();
+    let back = tuisnap::Frame::from_json(&std::fs::read_to_string(&outcome.actual_frame).unwrap())
+        .unwrap();
     assert_eq!(back.digest(), frame.digest());
 }

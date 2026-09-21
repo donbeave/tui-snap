@@ -284,11 +284,13 @@ fn main() -> Result<()> {
             let frame = tuisnap::Frame::from_json(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
             if grouped {
                 let st = tuisnap::grouped::GroupedStore::new(&store);
-                let outcome =
-                    st.check(&name, &frame, &profile, &owned.faces(), pixel_threshold)?;
+                let outcome = st.check(&name, &frame, &profile, &owned.faces(), pixel_threshold)?;
                 let entry = tuisnap::snapshot::report_entry(&outcome.outcome, &profile)?;
-                let report =
-                    tuisnap::snapshot::write_report_at(&st.report_path(), "tuisnap visual report", &[entry])?;
+                let report = tuisnap::snapshot::write_report_at(
+                    &st.report_path(),
+                    "tuisnap visual report",
+                    &[entry],
+                )?;
                 eprintln!("report: {}", report.display());
                 outcome
                     .ensure_matched()
@@ -404,7 +406,8 @@ fn main() -> Result<()> {
                 (Some(root), Some(n)) => {
                     let (owned, profile) = load_font_bytes(font_file.as_ref())?;
                     let st = tuisnap::snapshot::Store::new(&root);
-                    let outcome = st.check(&n, &frame, &profile, &owned.faces(), pixel_threshold)?;
+                    let outcome =
+                        st.check(&n, &frame, &profile, &owned.faces(), pixel_threshold)?;
                     let entry = st.report_entry(&outcome, &profile)?;
                     let report =
                         tuisnap::snapshot::write_report(&st, "tuisnap visual report", &[entry])?;

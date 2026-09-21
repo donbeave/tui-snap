@@ -417,13 +417,7 @@ fn cursor_styles_render() {
 // determinism, and the zero-drift contract for primary-covered frames.
 // ---------------------------------------------------------------------------
 
-/// Ink strictly inside cell `(x, y=0)` excluding the margin the deterministic
-/// tofu box's outline occupies: tofu scores 0, a real glyph scores plenty.
-fn interior_ink(png: &[u8], x: u16, span_cells: u32) -> usize {
-    cell_stats(png, x, span_cells).0
-}
-
-/// `(interior_ink, unique_colors_in_full_cell)`. Hollow tofu is 2 colors
+/// `(interior ink, unique_colors_in_full_cell)`. Hollow tofu is 2 colors
 /// (bg + solid outline); a real antialiased glyph is dozens.
 fn cell_stats(png: &[u8], x: u16, span_cells: u32) -> (usize, usize) {
     let img = image::load_from_memory(png).unwrap().to_rgb8();
